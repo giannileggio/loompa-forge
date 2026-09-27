@@ -1,0 +1,100 @@
+# File formats
+
+All state lives under one folder: `$LF_HOME`, default `~/.loompa-forge`.
+
+```
+~/.loompa-forge/
+  config.toml    user preferences and defaults
+  tasks/         queue: one <id>.md per task
+  schedules/     recurring task templates: one <id>.md per schedule
+  archive/       finished tasks, moved out of tasks/
+  logs/          one log per task run
+```
+
+Tasks and schedules are Markdown files with a YAML frontmatter block. The
+**body is the prompt** given to the agent. Unknown frontmatter keys are
+errors, so typos don't silently fall back to defaults. Run `lf validate` after
+editing any file.
+
+## Task — `tasks/<id>.md`
+
+```markdown
+---
+id: fix-login-redirect
+repo: ~/Projects/myapp
+branch: fix/login-redirect
+on_finish: pr
+retries: 3
+scheduled_at: 2026-09-28T02:00:00+02:00
+---
+
+Fix the redirect loop after login when the session cookie has expired.
+Add a regression test.
+```
+
+### Fields you write
+
+| Field          | Required | Default (config `[defaults]`) | Meaning |
+|----------------|----------|-------------------------------|---------|
+| `id`           | yes      | —                 | `a-z`, `0-9`, `-`, max 64 chars. Must equal the file name without `.md`. |
+| `repo`         | yes      | —                 | Folder the task runs in. `~` is expanded. |
+| `branch`       | no       | `lf/<id>` if `worktree` | Branch to work on. |
+| `worktree`     | no       | `true`            | Run in a dedicated git worktree for the branch. |
+| `agent`        | no       | `claude`          | Name of an agent defined in `config.toml` `[agents.*]`. |
+| `model`        | no       | `claude-sonnet-5` | Passed to the agent as `{model}`. |
+| `mode`         | no       | `headless`        | `headless`: non-interactive, exit code decides the outcome. `interactive`: a live session that finishes with `lf done` / `lf fail`. |
+| `on_finish`    | no       | `none`            | `none` \| `commit` \| `push` \| `pr` |
+| `retries`      | no       | `1`               | Extra attempts after a failure. |
+| `retry_delay`  | no       | `5m`              | Wait between attempts (`30s`, `5m`, `1h`...). |
+| `timeout`      | no       | `2h`              | Per attempt. |
+| `scheduled_at` | no       | now               | Don't start before this RFC 3339 time. |
+| `created_by`   | no       | —                 | Free text: `cli`, `agent`, `schedule:<id>`... |
+| `created_at`   | no       | —                 | RFC 3339; set by `lf add`. |
+
+### Fields loompa-forge writes
+
+Don't edit these by hand. Use `lf` commands to change the status.
+
+| Field         | Meaning |
+|---------------|---------|
+| `status`      | `pending` → `running` → `done` \| `failed` \| `cancelled` \| `needs_review` |
+| `attempts`    | Attempts started so far. |
+| `started_at`, `finished_at` | RFC 3339. |
+| `exit_code`   | Headless mode only. |
+| `tmux_window` | Where the task is or was running. |
+| `error`       | Last failure reason. |
+
+`needs_review` means an interactive session ended without signalling
+`lf done` or `lf fail`.
+
+## Schedule — `schedules/<id>.md`
+
+A schedule has the same fields as a task (except the ones loompa-forge writes
+on tasks), plus:
+
+| Field              | Required | Meaning |
+|--------------------|----------|---------|
+| `cron`             | yes      | 5-field cron expression in local time, e.g. `"0 2 * * *"`. Quote it. |
+| `enabled`          | no       | Default `true`. |
+| `last_enqueued_at` | —        | Written by loompa-forge. |
+
+```markdown
+---
+id: nightly-deps
+cron: "0 2 * * *"
+repo: ~/Projects/myapp
+on_finish: pr
+---
+
+Update dependencies, run the test suite, and fix any breakage.
+```
+
+Each time the schedule fires, loompa-forge creates a task in `tasks/` with the
+schedule's fields and prompt and sets `created_by: schedule:<id>`.
+
+## Config — `config.toml`
+
+`lf init` writes a commented copy of every default. See
+[`src/config.rs`](../src/config.rs) (`DEFAULT_CONFIG_TOML`). Agents are argv
+lists with `{prompt}`, `{model}` and `{id}` placeholders. No shell is involved,
+so prompts need no quoting.
