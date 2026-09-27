@@ -60,6 +60,17 @@ impl Home {
         ]
     }
 
+    /// Blocks until no other `lf` process is changing task files, and holds
+    /// that lock until the returned file is dropped.
+    pub fn lock(&self) -> Result<std::fs::File> {
+        let path = self.root.join(".lock");
+        let file =
+            std::fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(file)
+    }
+
     /// Fails with a helpful message if `lf init` has not been run.
     pub fn ensure_initialized(&self) -> Result<()> {
         if !self.tasks().is_dir() {

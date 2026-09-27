@@ -76,6 +76,24 @@ Don't edit these by hand. Use `lf` commands to change the status.
 `needs_review` means an interactive session ended without signalling
 `lf done` or `lf fail`.
 
+### Changing the status by hand
+
+| Command | Works on | Effect |
+|---------|----------|--------|
+| `lf done [id]`   | running, needs_review, failed | Ends the session if running, runs `on_finish`, archives as `done` (or `failed` if `on_finish` fails). |
+| `lf fail [id] [-r reason]` | running, needs_review | Ends the session if running, archives as `failed` without retrying. |
+| `lf cancel [id]` | pending, running | Ends the session if running, archives as `cancelled`. `on_finish` doesn't run. |
+| `lf retry <id>`  | failed, cancelled, needs_review | Moves it back to `tasks/` as `pending`, to start as soon as possible in the same worktree. |
+| `lf attach [id]` | running | Opens the task's tmux window, or the whole session without an id. |
+
+`id` defaults to `$LF_TASK_ID`, so inside a task's window a plain `lf done`
+works: the user can type `! lf done` in the agent, or the agent can run it.
+Ending a session saves its output to the attempt's log first.
+
+`attempts` keeps counting across `lf retry`, so earlier logs are kept. That
+also means automatic retries aren't renewed: if the retried attempt fails,
+the task is `failed` unless `retries` still covers the new count.
+
 A failed attempt (non-zero exit, signal, timeout, or a start error such as a
 worktree that can't be created) goes back to `pending` with `scheduled_at`
 pushed out by `retry_delay` while retries remain; then it's `failed`. A task

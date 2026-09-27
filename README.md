@@ -20,10 +20,9 @@ and queue it with `lf add`.
 ## Status
 
 Working now: `init`, `add`, `ls`, `validate`, `lf run` (the runner and
-scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`), and
-the agent skill for writing tasks. Next: `lf done|fail|cancel|retry|attach`
-(interactive tasks currently end as `needs_review` when their session
-closes) and worktree cleanup.
+scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`),
+`done|fail|cancel|retry|attach`, and the agent skill for writing tasks.
+Next: worktree cleanup.
 
 ## Install
 
@@ -46,8 +45,16 @@ lf validate          # check every task and schedule file
 
 lf run               # run the queue until Ctrl-C (rescans every poll_interval)
 lf run --once        # one pass: enqueue due schedules, reap finished tasks, start new ones
-tmux attach -t loompa   # watch running tasks, one window each
+lf attach [id]       # watch running tasks in tmux, one window each
+
+lf done [id]         # finish a task: runs on_finish, archives it
+lf fail [id] -r why  # give up on it, without retrying
+lf cancel [id]       # drop a pending or running task
+lf retry <id>        # requeue a failed/cancelled/needs_review task
 ```
+
+Inside a task's window, `id` defaults to that task, so an interactive
+session ends with a plain `lf done` (or `! lf done` from the agent's prompt).
 
 `lf run` starts each task in a window of the `loompa` tmux session, inside
 `~/.loompa-forge/worktrees/<id>` (a git worktree on the task's branch) unless

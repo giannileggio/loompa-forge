@@ -1,5 +1,6 @@
 mod cmd;
 mod config;
+mod control;
 mod frontmatter;
 mod git;
 mod home;
@@ -48,6 +49,24 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Mark a task done: ends its session, runs on_finish, archives it.
+    ///
+    /// For running, needs_review or failed tasks. ID defaults to $LF_TASK_ID,
+    /// which is set inside each task's window.
+    Done { id: Option<String> },
+    /// Mark a running or needs_review task failed, without retrying.
+    Fail {
+        id: Option<String>,
+        /// Recorded as the task's `error`.
+        #[arg(long, short)]
+        reason: Option<String>,
+    },
+    /// Cancel a pending or running task. on_finish doesn't run.
+    Cancel { id: Option<String> },
+    /// Requeue a failed, cancelled or needs_review task, in the same worktree.
+    Retry { id: String },
+    /// Attach to a running task's tmux window (or the whole session).
+    Attach { id: Option<String> },
     /// Launch a task's agent in the current process (used by `lf run`).
     #[command(hide = true)]
     Exec {
@@ -76,6 +95,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Add(args) => cmd::add(&home, *args)?,
         Command::Validate { files } => return cmd::validate(&home, files),
         Command::Run { once } => run::run(&home, once)?,
+        Command::Done { id } => control::done(&home, id)?,
+        Command::Fail { id, reason } => control::fail(&home, id, reason)?,
+        Command::Cancel { id } => control::cancel(&home, id)?,
+        Command::Retry { id } => control::retry(&home, &id)?,
+        Command::Attach { id } => control::attach(&home, id)?,
         Command::Exec { id, status_file } => return run::exec(&home, &id, &status_file),
     }
     Ok(ExitCode::SUCCESS)

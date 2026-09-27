@@ -107,12 +107,17 @@ fires at the next matching time after `lf run` sees it.
 
 - Check the current state with `lf ls` (or read the file) first.
 - **Pending tasks** and **schedules**: you may edit the prompt and the fields
-  from step 1, then run `lf validate <file>`. To drop a pending task, delete
-  its file, but confirm with the user first. To pause a schedule, set
+  from step 1, then run `lf validate <file>`. To pause a schedule, set
   `enabled: false`.
+- Change a status only with these commands, and confirm with the user first:
+  `lf cancel <id>` (pending or running), `lf retry <id>` (failed, cancelled
+  or needs_review: requeues it), `lf done <id>` (runs `on_finish`, e.g. opens
+  the PR) and `lf fail <id> -r "<why>"`. The `error:` field and
+  `logs/<id>.<attempt>.log` show why a task failed.
 - Never edit fields lf writes (`status`, `attempts`, `started_at`,
-  `finished_at`, `exit_code`, `tmux_window`, `error`, `last_enqueued_at`).
-- Don't touch tasks that are `running`, or anything in `archive/`, `logs/` or
+  `finished_at`, `exit_code`, `tmux_window`, `error`, `last_enqueued_at`),
+  and never delete task files.
+- Don't edit `running` tasks, or anything in `archive/`, `logs/` or
   `worktrees/`.
 
 ## 6. Report back

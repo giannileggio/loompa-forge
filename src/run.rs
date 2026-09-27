@@ -148,6 +148,7 @@ fn read_exit(path: &Path) -> Result<Option<Exit>> {
 }
 
 fn tick(home: &Home, config: &Config) -> Result<()> {
+    let _lock = home.lock()?;
     let now = now();
     enqueue_schedules(home, config, now)?;
     poll_running(home, config, now)?;
@@ -287,14 +288,14 @@ fn timed_out(task: &Task, eff: &Effective, now: DateTime<FixedOffset>) -> bool {
 
 /// `(session, window)` the task runs in: what was recorded at start, or the
 /// configured session and the task id.
-fn window_of(task: &Task, config: &Config) -> (String, String) {
+pub fn window_of(task: &Task, config: &Config) -> (String, String) {
     match task.tmux_window.as_deref().and_then(|w| w.split_once(':')) {
         Some((s, w)) => (s.to_string(), w.to_string()),
         None => (config.runner.tmux_session.clone(), task.id.clone()),
     }
 }
 
-fn save_log(home: &Home, task: &Task, session: &str, window: &str) {
+pub fn save_log(home: &Home, task: &Task, session: &str, window: &str) {
     let path = home
         .logs()
         .join(format!("{}.{}.log", task.id, task.attempts));
@@ -317,18 +318,7 @@ fn finish(
     match outcome {
         Outcome::Succeeded(code) => {
             task.exit_code = Some(code);
-            let dir = workdir(home, &task, &eff);
-            match git::on_finish(eff.on_finish, &dir, &task.id, &task.prompt) {
-                Ok(()) => {
-                    task.status = Status::Done;
-                    task.error = None;
-                }
-                Err(e) => {
-                    task.status = Status::Failed;
-                    task.error = Some(format!("on_finish failed: {e:#}"));
-                }
-            }
-            archive(home, path, task, now)
+            complete(home, config, path, task, now).map(drop)
         }
         Outcome::NeedsReview => {
             task.status = Status::NeedsReview;
@@ -339,6 +329,32 @@ fn finish(
             fail_attempt(home, path, task, &eff, error, now)
         }
     }
+}
+
+/// Runs `on_finish` and archives the task as done, or as failed if
+/// `on_finish` fails. Returns the final status.
+pub fn complete(
+    home: &Home,
+    config: &Config,
+    path: &Path,
+    mut task: Task,
+    now: DateTime<FixedOffset>,
+) -> Result<Status> {
+    let eff = task.spec.resolve(&config.defaults);
+    let dir = workdir(home, &task, &eff);
+    match git::on_finish(eff.on_finish, &dir, &task.id, &task.prompt) {
+        Ok(()) => {
+            task.status = Status::Done;
+            task.error = None;
+        }
+        Err(e) => {
+            task.status = Status::Failed;
+            task.error = Some(format!("on_finish failed: {e:#}"));
+        }
+    }
+    let status = task.status;
+    archive(home, path, task, now)?;
+    Ok(status)
 }
 
 /// Requeues the task after `retry_delay` if it has retries left, otherwise
@@ -375,7 +391,9 @@ fn retry_left(attempts: u32, retries: u32) -> bool {
     attempts <= retries
 }
 
-fn archive(home: &Home, path: &Path, mut task: Task, now: DateTime<FixedOffset>) -> Result<()> {
+/// Stamps `finished_at` and moves the task to `archive/` (a no-op move if
+/// it's already there).
+pub fn archive(home: &Home, path: &Path, mut task: Task, now: DateTime<FixedOffset>) -> Result<()> {
     task.finished_at = Some(now);
     task.save(path)?;
     let dest = home.archive().join(format!("{}.md", task.id));
@@ -452,7 +470,10 @@ fn start(
     let launched = prepare_workdir(home, config, &task, &eff).and_then(|dir| {
         // A leftover window with the same name would make targets ambiguous.
         tmux::kill_window(session, &task.id)?;
+        // A record left by an earlier task with this id would end this
+        // attempt as soon as it's polled.
         let status = status_file(home, &task.id, task.attempts);
+        remove_if_exists(&status)?;
         tmux::spawn(
             session,
             &task.id,
@@ -485,7 +506,16 @@ fn start(
     }
 }
 
-fn workdir(home: &Home, task: &Task, eff: &Effective) -> PathBuf {
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+pub fn workdir(home: &Home, task: &Task, eff: &Effective) -> PathBuf {
     if eff.worktree {
         home.worktrees().join(&task.id)
     } else {
@@ -548,7 +578,7 @@ fn load_tasks(home: &Home, status: Status) -> Result<Vec<(PathBuf, Task)>> {
     Ok(out)
 }
 
-fn log(msg: &str) {
+pub fn log(msg: &str) {
     println!("{} {msg}", Local::now().format("%Y-%m-%d %H:%M:%S"));
 }
 

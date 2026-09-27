@@ -123,6 +123,28 @@ pub fn capture(session: &str, window: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Replaces this process with a tmux client showing `session`, focused on
+/// `window` if given. Inside tmux, switches the current client instead of
+/// nesting. Returns only on failure.
+pub fn attach(session: &str, window: Option<&str>) -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let session_target = format!("={session}");
+    let mut args = Vec::new();
+    let window_target;
+    if let Some(w) = window {
+        window_target = format!("={session}:={w}");
+        args.extend(["select-window", "-t", &window_target, ";"]);
+    }
+    let client = if std::env::var_os("TMUX").is_some() {
+        "switch-client"
+    } else {
+        "attach-session"
+    };
+    args.extend([client, "-t", &session_target]);
+    let err = Command::new("tmux").args(&args).exec();
+    anyhow::Error::new(err).context("running tmux (is it installed?)")
+}
+
 /// Kills the window. A window that's already gone is not an error.
 pub fn kill_window(session: &str, window: &str) -> Result<()> {
     let out = tmux(&["kill-window", "-t", &format!("={session}:={window}")])?;
