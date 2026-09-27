@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -108,7 +108,26 @@ fn choose_agent(given: Option<String>) -> Result<Option<String>> {
     }
 }
 
-pub fn ls(home: &Home, archive: bool, schedules: bool) -> Result<()> {
+/// Prints the listing once, or every `interval` (clearing the screen
+/// between refreshes) until interrupted.
+pub fn ls(home: &Home, archive: bool, schedules: bool, watch: Option<Duration>) -> Result<()> {
+    let Some(interval) = watch else {
+        return ls_once(home, archive, schedules);
+    };
+    loop {
+        print!("\x1B[2J\x1B[H"); // clear screen, cursor to top-left
+        println!(
+            "every {} until Ctrl-C, as of {}\n",
+            humantime::format_duration(interval),
+            fmt_time(now())
+        );
+        ls_once(home, archive, schedules)?;
+        std::io::stdout().flush().ok();
+        std::thread::sleep(interval);
+    }
+}
+
+fn ls_once(home: &Home, archive: bool, schedules: bool) -> Result<()> {
     home.ensure_initialized()?;
     let config = Config::load(&home.config_path())?;
     if schedules {

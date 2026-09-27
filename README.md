@@ -58,6 +58,7 @@ echo "Update deps and run tests" | lf add --repo ~/Projects/myapp --agent codex
 lf ls                # queue
 lf ls --schedules    # schedules with their next run
 lf ls --archive      # finished tasks
+lf ls --watch        # ...refreshed every --interval (default 2s) until Ctrl-C
 lf validate          # check every task and schedule file
 
 lf run               # run the queue until Ctrl-C (rescans every poll_interval)

@@ -246,3 +246,27 @@ fn commands_fail_clearly_before_init() {
     let out = failed(run(lf(home.path()).arg("ls")));
     assert!(stderr(&out).contains("not initialized"));
 }
+
+#[test]
+fn ls_watch_refreshes_until_killed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init(home.path());
+    add(home.path(), repo.path(), "watched", "do it");
+
+    let mut child = lf(home.path())
+        .args(["ls", "--watch", "--interval", "20ms"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    child.kill().unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    let text = stdout(&out);
+    assert!(
+        text.matches("watched").count() >= 2,
+        "expected multiple refreshes, got:\n{text}"
+    );
+    assert!(text.contains("\x1B[2J\x1B[H"));
+}

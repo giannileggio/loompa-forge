@@ -42,6 +42,12 @@ enum Command {
         archive: bool,
         #[arg(long)]
         schedules: bool,
+        /// Refresh the listing instead of printing it once.
+        #[arg(long)]
+        watch: bool,
+        /// Refresh interval when watching, e.g. 2s.
+        #[arg(long, value_parser = humantime::parse_duration, default_value = "2s")]
+        interval: std::time::Duration,
     },
     /// Create a new task file.
     Add(Box<cmd::AddArgs>),
@@ -102,7 +108,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
     match cli.command {
         Command::Init(args) => cmd::init(&home, args)?,
-        Command::Ls { archive, schedules } => cmd::ls(&home, archive, schedules)?,
+        Command::Ls {
+            archive,
+            schedules,
+            watch,
+            interval,
+        } => cmd::ls(&home, archive, schedules, watch.then_some(interval))?,
         Command::Add(args) => cmd::add(&home, *args)?,
         Command::Validate { files } => return cmd::validate(&home, files),
         Command::Run { once } => run::run(&home, once)?,

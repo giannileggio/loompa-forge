@@ -18,4 +18,4 @@ Layout:
 - `config.toml`: runner settings, defaults, and the agents tasks can use
 
 Useful commands: `lf ls`, `lf ls --schedules`, `lf ls --archive`,
-`lf validate`.
+`lf ls --watch`, `lf validate`.
