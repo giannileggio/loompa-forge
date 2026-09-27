@@ -87,8 +87,11 @@ fix them and run it again.
 ## 4. Recurring work: schedules
 
 For "every night", "each Monday" and the like, write
-`{home}/schedules/<id>.md` yourself. Use the same fields as a task, plus a quoted 5-field `cron` in
-local time. The body is the prompt, written as in step 2.
+`{home}/schedules/<id>.md` yourself. Use `id` plus the fields from step 1
+(`repo`, `branch`, `agent`, `model`, ...), plus a quoted 5-field `cron` in
+local time. Schedules have no `created_by`/`created_at`/`scheduled_at`: each
+firing sets those on the task it creates. The body is the prompt, written as
+in step 2.
 
 ```markdown
 ---
@@ -96,7 +99,6 @@ id: weekly-deps
 cron: "0 6 * * 1"
 repo: ~/Projects/myapp
 on_finish: pr
-created_by: agent
 ---
 
 Update dependencies to their latest compatible versions...

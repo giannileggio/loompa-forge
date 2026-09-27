@@ -119,8 +119,10 @@ The agent runs with `LF_HOME` and `LF_TASK_ID` set.
 
 ## Schedule — `schedules/<id>.md`
 
-A schedule has the same fields as a task (except the ones loompa-forge writes
-on tasks), plus:
+A schedule has `id` plus the same `repo`/`branch`/`worktree`/`agent`/`model`/
+`mode`/`on_finish`/`retries`/`retry_delay`/`timeout` fields as a task. It has
+no `scheduled_at`, `created_by` or `created_at`: each firing sets those on
+the task it creates. It also adds:
 
 | Field              | Required | Meaning |
 |--------------------|----------|---------|
