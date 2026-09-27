@@ -64,6 +64,8 @@ lf validate          # check every task and schedule file
 lf run               # run the queue until Ctrl-C (rescans every poll_interval)
 lf run --once        # one pass: enqueue due schedules, reap finished tasks, start new ones
 lf attach [id]       # watch running tasks in tmux, one window each
+lf logs <id>         # print a task's output: live if running, else the saved log
+lf logs <id> --attempt 1   # an earlier attempt, instead of the latest
 
 lf done [id]         # finish a task: runs on_finish, archives it
 lf fail [id] -r why  # give up on it, without retrying

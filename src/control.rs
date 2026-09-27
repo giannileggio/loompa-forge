@@ -126,6 +126,30 @@ pub fn attach(home: &Home, id: Option<String>) -> Result<()> {
     Err(tmux::attach(&session, Some(&window)))
 }
 
+/// A task's captured output: the live tmux pane if it's still running,
+/// else the saved log for an attempt (the latest, by default).
+pub fn logs(home: &Home, id: &str, attempt: Option<u32>) -> Result<String> {
+    home.ensure_initialized()?;
+    let config = Config::load(&home.config_path())?;
+    let (_, task) = find(home, id)?;
+    if task.attempts == 0 {
+        bail!("`{id}` hasn't started yet");
+    }
+    let attempt = attempt.unwrap_or(task.attempts);
+    if attempt == 0 || attempt > task.attempts {
+        bail!("`{id}` has {} attempt(s) so far", task.attempts);
+    }
+    if task.status == Status::Running && attempt == task.attempts {
+        let (session, window) = run::window_of(&task, &config);
+        if tmux::session_exists(&session) {
+            return tmux::capture(&session, &window);
+        }
+    }
+    let path = home.logs().join(format!("{id}.{attempt}.log"));
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("no log saved for `{id}` attempt {attempt}"))
+}
+
 fn setup(home: &Home, id: Option<String>) -> Result<(Config, String)> {
     home.ensure_initialized()?;
     let config = Config::load(&home.config_path())?;
@@ -243,6 +267,25 @@ mod tests {
         let (_, t) = find(&home, "bad").unwrap();
         assert_eq!(t.status, Status::Failed);
         assert_eq!(t.error.as_deref(), Some("wrong approach"));
+    }
+
+    #[test]
+    fn logs_reports_missing_attempts_and_reads_saved_ones() {
+        let (_d, home) = home();
+        put(home.tasks(), "p", Status::Pending);
+        assert!(logs(&home, "p", None).is_err());
+
+        let (path, mut task) = find(&home, "p").unwrap();
+        task.attempts = 2;
+        task.status = Status::Failed;
+        task.save(&path).unwrap();
+        std::fs::write(home.logs().join("p.1.log"), "first\n").unwrap();
+        std::fs::write(home.logs().join("p.2.log"), "second\n").unwrap();
+
+        assert_eq!(logs(&home, "p", None).unwrap(), "second\n");
+        assert_eq!(logs(&home, "p", Some(1)).unwrap(), "first\n");
+        assert!(logs(&home, "p", Some(3)).is_err());
+        assert!(logs(&home, "p", Some(0)).is_err());
     }
 
     #[test]

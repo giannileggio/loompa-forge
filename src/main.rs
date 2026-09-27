@@ -77,6 +77,16 @@ enum Command {
     Retry { id: String },
     /// Attach to a running task's tmux window (or the whole session).
     Attach { id: Option<String> },
+    /// Print a task's captured output.
+    ///
+    /// The live tmux pane if it's still running, else the saved log for an
+    /// attempt (the latest, by default).
+    Logs {
+        id: String,
+        /// An earlier attempt, instead of the latest.
+        #[arg(long)]
+        attempt: Option<u32>,
+    },
     /// Remove the worktrees of finished tasks (done only, unless --all).
     ///
     /// Worktrees with uncommitted changes are kept. Branches are never deleted.
@@ -122,6 +132,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Cancel { id } => control::cancel(&home, id)?,
         Command::Retry { id } => control::retry(&home, &id)?,
         Command::Attach { id } => control::attach(&home, id)?,
+        Command::Logs { id, attempt } => print!("{}", control::logs(&home, &id, attempt)?),
         Command::Clean(args) => clean::clean(&home, args)?,
         Command::Exec { id, status_file } => return run::exec(&home, &id, &status_file),
     }

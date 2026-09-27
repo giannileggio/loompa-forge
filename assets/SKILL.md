@@ -118,7 +118,7 @@ fires at the next matching time after `lf run` sees it.
   `{lf} cancel <id>` (pending or running), `{lf} retry <id>` (failed,
   cancelled or needs_review: requeues it), `{lf} done <id>` (runs
   `on_finish`, e.g. opens the PR) and `{lf} fail <id> -r "<why>"`. The
-  `error:` field and `{home}/logs/<id>.<attempt>.log` show why a task failed.
+  `error:` field says why a task failed; `{lf} logs <id>` prints its output.
 - Never edit fields lf writes (`status`, `attempts`, `started_at`,
   `finished_at`, `exit_code`, `tmux_window`, `error`, `last_enqueued_at`),
   and never delete task files.

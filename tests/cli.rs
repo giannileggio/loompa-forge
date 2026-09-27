@@ -240,6 +240,34 @@ fn cancel_then_retry_via_cli() {
 }
 
 #[test]
+fn logs_reads_a_saved_attempt_via_the_cli() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init(home.path());
+    add(home.path(), repo.path(), "t1", "do it");
+
+    let out = failed(run(lf(home.path()).args(["logs", "t1"])));
+    assert!(stderr(&out).contains("hasn't started"));
+
+    // Fake a finished attempt: bump `attempts` on the task file and write
+    // the log `lf run` would have saved.
+    let task_path = home.path().join("tasks/t1.md");
+    let content = std::fs::read_to_string(&task_path).unwrap();
+    std::fs::write(
+        &task_path,
+        content.replacen("---\n", "---\nattempts: 1\n", 1),
+    )
+    .unwrap();
+    std::fs::write(home.path().join("logs/t1.1.log"), "hello from the agent\n").unwrap();
+
+    let out = stdout(&ok(run(lf(home.path()).args(["logs", "t1"]))));
+    assert_eq!(out, "hello from the agent\n");
+
+    let out = failed(run(lf(home.path()).args(["logs", "t1", "--attempt", "2"])));
+    assert!(stderr(&out).contains("1 attempt"));
+}
+
+#[test]
 fn commands_fail_clearly_before_init() {
     let home = tempfile::tempdir().unwrap();
 

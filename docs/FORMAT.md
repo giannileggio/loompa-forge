@@ -98,6 +98,10 @@ Don't edit these by hand. Use `lf` commands to change the status.
 works: run it in the agent's shell, or ask the agent to run it.
 Ending a session saves its output to the attempt's log first.
 
+`lf logs <id> [--attempt N]` prints that output: the live tmux pane for a
+task still running, else `logs/<id>.<attempt>.log` (the latest attempt by
+default).
+
 `lf clean` removes `worktrees/<id>` of archived `done` tasks (`--all`: any
 archived task, and worktrees with no task file; `--older-than 7d`: only
 tasks finished that long ago; `-n`: dry run). It never removes a worktree
