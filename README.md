@@ -30,9 +30,22 @@ tasks.
 ## Install
 
 ```sh
-cargo install --path .
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/giannileggio/loompa-forge/releases/latest/download/loompa-forge-installer.sh | sh
 lf init            # creates ~/.loompa-forge (override with $LF_HOME or --home);
                    # asks for the default agent and whether to install the skill globally
+```
+
+Prebuilt binaries are published for Linux and macOS (x86_64 and arm64); the
+script above fetches the right one and puts `lf` on your `PATH`. It also
+installs `loompa-forge-update`, so `loompa-forge-update` upgrades an
+existing install, and `lf` itself prints a one-line notice when a newer
+version is out (set `LF_NO_UPDATE_CHECK=1` to turn that off).
+
+Building from source instead:
+
+```sh
+cargo install --path .
 ```
 
 ## Usage

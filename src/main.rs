@@ -11,6 +11,7 @@ mod skill;
 mod spec;
 mod task;
 mod tmux;
+mod update_check;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -96,6 +97,9 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let home = Home::resolve(cli.home)?;
+    if !matches!(cli.command, Command::Exec { .. }) {
+        update_check::check(&home);
+    }
     match cli.command {
         Command::Init(args) => cmd::init(&home, args)?,
         Command::Ls { archive, schedules } => cmd::ls(&home, archive, schedules)?,
