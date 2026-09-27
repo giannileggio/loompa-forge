@@ -10,15 +10,23 @@ All state lives under one folder: `$LF_HOME`, default `~/.loompa-forge`.
   archive/       finished tasks, moved out of tasks/
   logs/          <id>.<attempt>.log (pane output) and .exit (exit status) per run
   worktrees/     <id>/: the git worktree a task runs in (kept until `lf clean`)
-  AGENTS.md      guide for an agent opened in this folder (CLAUDE.md imports it)
+  AGENTS.md      guide for any agent opened in this folder
+  CLAUDE.md, GEMINI.md   `@AGENTS.md`, for agents that don't read AGENTS.md
   FORMAT.md      this document
-  .claude/skills/lf-tasks/SKILL.md   how an agent creates and edits tasks
+  .agents/skills/lf-tasks/SKILL.md   how an agent creates and edits tasks
+  .claude/skills/lf-tasks            link to it, for agents with their own skill folder
 ```
 
-Open your coding agent in this folder and ask it to "add a task to..." or
+Open any coding agent in this folder and ask it to "add a task to..." or
 "every night, ...": the `lf-tasks` skill tells it how. `lf init` keeps your
-`AGENTS.md` and `CLAUDE.md` if they exist, and rewrites `FORMAT.md` and the
-skill so they match the installed `lf`.
+`AGENTS.md`, `CLAUDE.md` and `GEMINI.md` if they exist, and rewrites
+`FORMAT.md` and the skill so they match the installed `lf`.
+
+`lf init` also offers to make the skill available in every project (or pass
+`--global-skill` / `--no-global-skill`): it links `~/.agents/skills/lf-tasks`,
+and `~/.claude/skills/lf-tasks` if `~/.claude` exists, to this folder's skill.
+Agents can then queue tasks from inside any repo ("queue a task for this
+repo..."). Once linked, every `lf init` keeps the links pointing here.
 
 Tasks and schedules are Markdown files with a YAML frontmatter block. The
 **body is the prompt** given to the agent. Unknown frontmatter keys are
@@ -49,8 +57,8 @@ Add a regression test.
 | `repo`         | yes      | —                 | Folder the task runs in: absolute, or starting with `~`. |
 | `branch`       | no       | `lf/<id>` if `worktree` | Branch to work on. |
 | `worktree`     | no       | `true`            | Run in a dedicated git worktree for the branch. |
-| `agent`        | no       | `claude`          | Name of an agent defined in `config.toml` `[agents.*]`. |
-| `model`        | no       | `claude-sonnet-5` | Passed to the agent as `{model}`. |
+| `agent`        | no       | chosen at `lf init` | Name of an agent in `config.toml` `[agents.*]`. |
+| `model`        | no       | the agent's own   | Model id, in the form that agent's CLI expects. |
 | `mode`         | no       | `headless`        | `headless`: non-interactive, exit code decides the outcome. `interactive`: a live session that finishes with `lf done` / `lf fail`. |
 | `on_finish`    | no       | `none`            | `none` \| `commit` \| `push` \| `pr` |
 | `retries`      | no       | `1`               | Extra attempts after a failure. |
@@ -87,7 +95,7 @@ Don't edit these by hand. Use `lf` commands to change the status.
 | `lf attach [id]` | running | Opens the task's tmux window, or the whole session without an id. |
 
 `id` defaults to `$LF_TASK_ID`, so inside a task's window a plain `lf done`
-works: the user can type `! lf done` in the agent, or the agent can run it.
+works: run it in the agent's shell, or ask the agent to run it.
 Ending a session saves its output to the attempt's log first.
 
 `lf clean` removes `worktrees/<id>` of archived `done` tasks (`--all`: any
@@ -139,6 +147,20 @@ records `last_enqueued_at`; it fires from then on. Firings missed while
 
 ## Config — `config.toml`
 
-`lf init` writes a `config.toml` with every default, commented. Agents are argv
-lists with `{prompt}`, `{model}` and `{id}` placeholders. No shell is involved,
-so prompts need no quoting.
+`lf init` writes a `config.toml` with every default, commented, and asks
+which agent tasks use by default (or detects the only one on `$PATH`, or
+takes `--agent`). Presets are built in for `claude`, `codex`, `gemini` and
+`opencode`; add an `[agents.<name>]` table for any other CLI agent:
+
+```toml
+[agents.aider]
+headless = ["aider", "--yes-always", "--message", "{prompt}"]
+interactive = ["aider", "--message", "{prompt}"]
+model_args = ["--model", "{model}"]   # appended only when a model is set
+model = "sonnet"                      # optional: this agent's default model
+```
+
+`headless` and `interactive` are argv lists with `{prompt}` and `{id}`
+placeholders. No shell is involved, so prompts need no quoting. A task's
+`model` (else the agent's `model`) fills `{model}` in `model_args`; with
+neither, nothing is added and the agent picks its own model.

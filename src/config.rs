@@ -7,9 +7,9 @@ use serde::Deserialize;
 
 use crate::spec::{Mode, OnFinish};
 
-/// Written by `lf init`. Must stay in sync with `Config::default()`
-/// (enforced by a test).
-pub const DEFAULT_CONFIG_TOML: &str = r#"# loompa-forge configuration.
+/// Written by `lf init`, with `{agent}` replaced by [`default_config_toml`].
+/// Must stay in sync with `Config::default()` (enforced by a test).
+const CONFIG_TEMPLATE: &str = r#"# loompa-forge configuration.
 # Every value below is the built-in default; delete what you don't change.
 
 [runner]
@@ -20,8 +20,7 @@ poll_interval = "30s"       # how often `lf run` rescans the folders
 
 # Fallbacks for any field a task or schedule doesn't set.
 [defaults]
-agent = "claude"
-model = "claude-sonnet-5"
+{agent}
 mode = "headless"           # headless | interactive
 worktree = true             # run each task in its own git worktree
 on_finish = "none"          # none | commit | push | pr
@@ -30,13 +29,47 @@ retry_delay = "5m"
 timeout = "2h"
 
 # How to launch each agent, as argv lists (no shell involved).
-# Placeholders: {prompt} {model} {id}
-# Headless runs can't answer permission prompts: add flags such as
-# "--permission-mode", "acceptEdits" (or an allowlist) to suit your trust level.
+# Placeholders: {prompt} {id}. `model_args` is appended only when a task (or
+# the agent's `model = "..."`) sets a model, filling in {model}; without one
+# the agent uses its own default. Add [agents.<name>] tables for any other
+# CLI agent; these presets stay available unless you redefine them.
+#
+# Headless runs can't answer permission prompts: add each agent's
+# auto-approve flags (e.g. claude "--permission-mode", "acceptEdits";
+# codex "--full-auto"; gemini "--yolo") to suit your trust level.
 [agents.claude]
-headless = ["claude", "-p", "{prompt}", "--model", "{model}"]
-interactive = ["claude", "--model", "{model}", "{prompt}"]
+headless = ["claude", "-p", "{prompt}"]
+interactive = ["claude", "{prompt}"]
+model_args = ["--model", "{model}"]
+
+[agents.codex]
+headless = ["codex", "exec", "{prompt}"]
+interactive = ["codex", "{prompt}"]
+model_args = ["--model", "{model}"]
+
+[agents.gemini]
+headless = ["gemini", "--prompt", "{prompt}"]
+interactive = ["gemini", "--prompt-interactive", "{prompt}"]
+model_args = ["--model", "{model}"]
+
+[agents.opencode]
+headless = ["opencode", "run", "{prompt}"]
+interactive = ["opencode", "--prompt", "{prompt}"]
+model_args = ["--model", "{model}"]
 "#;
+
+/// The config `lf init` writes, with `agent` as the default agent (left
+/// commented out if none was chosen).
+pub fn default_config_toml(agent: Option<&str>) -> String {
+    let line = match agent {
+        Some(a) => format!("{:<28}# any [agents.*] below", format!("agent = \"{a}\"")),
+        None => format!(
+            "{:<28}# any [agents.*] below; tasks without one fail",
+            "# agent = \"<name>\""
+        ),
+    };
+    CONFIG_TEMPLATE.replace("{agent}", &line)
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -59,8 +92,7 @@ pub struct Runner {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Defaults {
-    pub agent: String,
-    pub model: String,
+    pub agent: Option<String>,
     pub mode: Mode,
     pub worktree: bool,
     pub on_finish: OnFinish,
@@ -76,6 +108,12 @@ pub struct Defaults {
 pub struct Agent {
     pub headless: Vec<String>,
     pub interactive: Vec<String>,
+    /// Appended when a model is set, with `{model}` filled in.
+    #[serde(default)]
+    pub model_args: Vec<String>,
+    /// Model used when the task doesn't name one.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Default for Runner {
@@ -92,8 +130,7 @@ impl Default for Runner {
 impl Default for Defaults {
     fn default() -> Self {
         Self {
-            agent: "claude".into(),
-            model: "claude-sonnet-5".into(),
+            agent: None,
             mode: Mode::Headless,
             worktree: true,
             on_finish: OnFinish::None,
@@ -114,15 +151,59 @@ impl Default for Config {
     }
 }
 
+/// Presets for common CLI agents: `(name, headless, interactive)`. All take
+/// `--model`.
+const PRESETS: &[(&str, &[&str], &[&str])] = &[
+    (
+        "claude",
+        &["claude", "-p", "{prompt}"],
+        &["claude", "{prompt}"],
+    ),
+    (
+        "codex",
+        &["codex", "exec", "{prompt}"],
+        &["codex", "{prompt}"],
+    ),
+    (
+        "gemini",
+        &["gemini", "--prompt", "{prompt}"],
+        &["gemini", "--prompt-interactive", "{prompt}"],
+    ),
+    (
+        "opencode",
+        &["opencode", "run", "{prompt}"],
+        &["opencode", "--prompt", "{prompt}"],
+    ),
+];
+
 fn builtin_agents() -> BTreeMap<String, Agent> {
     let argv = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect();
-    BTreeMap::from([(
-        "claude".to_string(),
-        Agent {
-            headless: argv(&["claude", "-p", "{prompt}", "--model", "{model}"]),
-            interactive: argv(&["claude", "--model", "{model}", "{prompt}"]),
-        },
-    )])
+    PRESETS
+        .iter()
+        .map(|(name, headless, interactive)| {
+            let agent = Agent {
+                headless: argv(headless),
+                interactive: argv(interactive),
+                model_args: argv(&["--model", "{model}"]),
+                model: None,
+            };
+            (name.to_string(), agent)
+        })
+        .collect()
+}
+
+/// Preset agents whose program is on `$PATH`, in preset order.
+pub fn installed_presets() -> Vec<&'static str> {
+    PRESETS
+        .iter()
+        .filter(|(_, headless, _)| on_path(headless[0]))
+        .map(|(name, _, _)| *name)
+        .collect()
+}
+
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
 impl Config {
@@ -155,11 +236,10 @@ impl Config {
                 bail!("agents.{name}: `headless` and `interactive` must not be empty");
             }
         }
-        if !self.agents.contains_key(&self.defaults.agent) {
-            bail!(
-                "defaults.agent `{}` is not defined under [agents]",
-                self.defaults.agent
-            );
+        if let Some(agent) = &self.defaults.agent
+            && !self.agents.contains_key(agent)
+        {
+            bail!("defaults.agent `{agent}` is not defined under [agents]");
         }
         Ok(())
     }
@@ -172,9 +252,11 @@ mod tests {
     #[test]
     fn default_template_matches_builtin_defaults() {
         assert_eq!(
-            Config::parse(DEFAULT_CONFIG_TOML).unwrap(),
+            Config::parse(&default_config_toml(None)).unwrap(),
             Config::default()
         );
+        let with_agent = Config::parse(&default_config_toml(Some("codex"))).unwrap();
+        assert_eq!(with_agent.defaults.agent.as_deref(), Some("codex"));
     }
 
     #[test]
@@ -182,17 +264,17 @@ mod tests {
         let c = Config::parse("[runner]\nmax_parallel = 8\n").unwrap();
         assert_eq!(c.runner.max_parallel, 8);
         assert_eq!(c.runner.tmux_session, "loompa");
-        assert!(c.agents.contains_key("claude"));
+        assert_eq!(c.agents.len(), PRESETS.len());
     }
 
     #[test]
     fn custom_agents_are_added_to_builtins() {
         let c = Config::parse(
-            "[agents.opencode]\nheadless = [\"opencode\", \"run\", \"{prompt}\"]\ninteractive = [\"opencode\"]\n",
+            "[agents.aider]\nheadless = [\"aider\", \"--message\", \"{prompt}\"]\ninteractive = [\"aider\"]\n",
         )
         .unwrap();
         assert!(c.agents.contains_key("claude"));
-        assert!(c.agents.contains_key("opencode"));
+        assert!(c.agents["aider"].model_args.is_empty());
     }
 
     #[test]

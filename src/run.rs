@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Local};
 
 use crate::cmd::{md_files, unique_id};
-use crate::config::Config;
+use crate::config::{Agent, Config};
 use crate::git;
 use crate::home::Home;
 use crate::schedule::Schedule;
@@ -59,15 +59,13 @@ pub fn exec(home: &Home, id: &str, status_file: &Path) -> Result<ExitCode> {
         let config = Config::load(&home.config_path())?;
         let task = Task::load(&home.tasks().join(format!("{id}.md")))?;
         let eff = task.spec.resolve(&config.defaults);
+        let name = eff.agent.as_deref().context("no agent set")?;
         let agent = config
             .agents
-            .get(&eff.agent)
-            .with_context(|| format!("unknown agent `{}`", eff.agent))?;
-        let template = match eff.mode {
-            Mode::Headless => &agent.headless,
-            Mode::Interactive => &agent.interactive,
-        };
-        let argv = agent_argv(template, &task.prompt, &eff.model, &task.id);
+            .get(name)
+            .with_context(|| format!("unknown agent `{name}`"))?;
+        let model = eff.model.as_deref().or(agent.model.as_deref());
+        let argv = agent_argv(agent, eff.mode, &task.prompt, model, &task.id);
         Command::new(&argv[0])
             .args(&argv[1..])
             .env("LF_HOME", home.root())
@@ -551,13 +549,29 @@ fn exec_argv(home: &Home, id: &str, status_file: &Path) -> Result<Vec<String>> {
     ])
 }
 
-/// Fills `{model}`, `{id}` and `{prompt}` in an agent's argv template.
-/// `{prompt}` goes last so placeholders inside the prompt text stay literal.
-fn agent_argv(template: &[String], prompt: &str, model: &str, id: &str) -> Vec<String> {
+/// The agent's argv for `mode`, with `model_args` appended if there's a
+/// model. `{prompt}` is filled last so placeholders inside the prompt text
+/// stay literal.
+fn agent_argv(
+    agent: &Agent,
+    mode: Mode,
+    prompt: &str,
+    model: Option<&str>,
+    id: &str,
+) -> Vec<String> {
+    let template = match mode {
+        Mode::Headless => &agent.headless,
+        Mode::Interactive => &agent.interactive,
+    };
+    let model_args = match model {
+        Some(_) => agent.model_args.as_slice(),
+        None => &[],
+    };
     template
         .iter()
+        .chain(model_args)
         .map(|a| {
-            a.replace("{model}", model)
+            a.replace("{model}", model.unwrap_or_default())
                 .replace("{id}", id)
                 .replace("{prompt}", prompt)
         })
@@ -588,21 +602,21 @@ mod tests {
 
     #[test]
     fn fills_agent_placeholders() {
-        let template: Vec<String> = ["claude", "-p", "{prompt}", "--model", "{model}", "x-{id}"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let argv = agent_argv(&template, "fix {model}; rm -rf", "opus", "t1");
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let agent = Agent {
+            headless: argv(&["agent", "run", "{prompt}", "x-{id}"]),
+            interactive: argv(&["agent", "{prompt}"]),
+            model_args: argv(&["-m", "{model}"]),
+            model: None,
+        };
+        let prompt = "fix {model}; rm -rf";
         assert_eq!(
-            argv,
-            [
-                "claude",
-                "-p",
-                "fix {model}; rm -rf",
-                "--model",
-                "opus",
-                "x-t1"
-            ]
+            agent_argv(&agent, Mode::Headless, prompt, Some("big"), "t1"),
+            argv(&["agent", "run", prompt, "x-t1", "-m", "big"])
+        );
+        assert_eq!(
+            agent_argv(&agent, Mode::Interactive, prompt, None, "t1"),
+            argv(&["agent", prompt])
         );
     }
 

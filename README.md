@@ -10,12 +10,15 @@ Queue and run coding-agent tasks defined as Markdown files.
 - **`lf`** runs pending tasks in tmux, tracks their status in the file, and
   moves finished tasks to `archive/`.
 
+It works with any CLI coding agent: presets for Claude Code, Codex, Gemini
+CLI and opencode are built in, and others are a few lines of config.
+
 Because the format is plain Markdown, you can write tasks by hand, with
 `lf add`, or by asking an agent: open it in `~/.loompa-forge` and say "add a
 task to fix the login redirect in ~/Projects/myapp tonight, open a PR". `lf
-init` puts an `AGENTS.md` (plus a `CLAUDE.md` that imports it) and an
-`lf-tasks` skill there, which teach the agent to write a self-contained prompt
-and queue it with `lf add`.
+init` puts an `AGENTS.md` and an `lf-tasks` skill there, which teach the agent
+to write a self-contained prompt and queue it with `lf add`. It can also link
+the skill into your global skill folders, so you can queue work from any repo.
 
 ## Status
 
@@ -28,7 +31,8 @@ tasks.
 
 ```sh
 cargo install --path .
-lf init            # creates ~/.loompa-forge (override with $LF_HOME or --home)
+lf init            # creates ~/.loompa-forge (override with $LF_HOME or --home);
+                   # asks for the default agent and whether to install the skill globally
 ```
 
 ## Usage
@@ -36,7 +40,7 @@ lf init            # creates ~/.loompa-forge (override with $LF_HOME or --home)
 ```sh
 lf add --repo ~/Projects/myapp --on-finish pr --in 2h \
        --prompt "Fix the redirect loop after login"
-echo "Update deps and run tests" | lf add --repo ~/Projects/myapp --model claude-opus-5-5
+echo "Update deps and run tests" | lf add --repo ~/Projects/myapp --agent codex
 
 lf ls                # queue
 lf ls --schedules    # schedules with their next run
@@ -57,7 +61,7 @@ lf clean --all --older-than 7d   # ...and of failed/cancelled ones, a week on
 ```
 
 Inside a task's window, `id` defaults to that task, so an interactive
-session ends with a plain `lf done` (or `! lf done` from the agent's prompt).
+session ends with a plain `lf done`, run by you or by the agent.
 
 `lf run` starts each task in a window of the `loompa` tmux session, inside
 `~/.loompa-forge/worktrees/<id>` (a git worktree on the task's branch) unless

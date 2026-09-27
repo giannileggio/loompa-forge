@@ -1,13 +1,13 @@
 ---
 name: lf-tasks
-description: Create, schedule, edit or cancel loompa-forge (lf) tasks, the Markdown files that queue work for coding agents. Use when the user asks to add, queue or schedule a task, to set up something recurring ("every night...", "each Monday..."), or to change or drop queued work.
+description: Create, schedule, edit or cancel loompa-forge (lf) tasks, the Markdown files that queue work for coding agents to run later. Use when the user asks to add, queue or schedule a task (for this repo or another), to set up something recurring ("every night...", "each Monday..."), or to change or drop queued work.
 ---
 
 # Managing lf tasks
 
-This folder (`$LF_HOME`, usually `~/.loompa-forge`) holds the queue. The full
-format is in `FORMAT.md` next to `config.toml`. Read it if anything here is
-unclear.
+The queue lives in `{home}`. The full format is in `{home}/FORMAT.md`; read
+it if anything here is unclear. Run every command exactly as written here
+(`{lf} ...`), from any folder.
 
 A task is run later, by another agent, in the target repo. That agent has no
 access to this conversation. Your job is to turn what the user said into a
@@ -15,19 +15,22 @@ task it can carry out.
 
 ## 1. Work out the details
 
-- **Repo**: an absolute path or one starting with `~`. If the user gives only
-  a name, look for it in the `REPO` column of `lf ls`, `lf ls --archive` and
-  `lf ls --schedules`, or check that `~/Projects/<name>` exists. If it's still
-  ambiguous, ask. Don't guess.
+- **Repo**: an absolute path or one starting with `~`. "This repo", or no
+  repo at all while you're working in a git repo outside `{home}`, means that
+  repo's root (`git rev-parse --show-toplevel`). If the user gives only a
+  name, look for it in the `REPO` column of `{lf} ls`, `{lf} ls --archive` and
+  `{lf} ls --schedules`, or check that `~/Projects/<name>` exists. If it's
+  still ambiguous, ask. Don't guess.
 - **What to do**: if the request is vague ("clean up the auth code"), ask
   one or two questions before you queue it. A vague task wastes a whole run.
 - **When**: now (the default), at a given time, after a delay, or on a
   recurring schedule (see section 4).
 - **Only set fields the user asked for.** Anything you leave out falls back
-  to `[defaults]` in `config.toml`, which is what the user expects. Examples:
-  "open a PR" → `--on-finish pr`; "I'll drive it" → `--mode interactive`;
-  "use opus" → `--model` with the full model name. The allowed `--agent`
-  values are the `[agents.*]` sections in `config.toml`.
+  to `[defaults]` in `{home}/config.toml`, which is what the user expects.
+  Examples: "open a PR" → `--on-finish pr`; "I'll drive it" →
+  `--mode interactive`; "use codex" → `--agent codex` (the allowed names are
+  the `[agents.*]` sections in config.toml); a named model → `--model` with
+  the model id in the form that agent's CLI expects.
 
 ## 2. Write the prompt
 
@@ -46,14 +49,14 @@ and can't ask questions (headless runs have nobody to answer):
 Don't invent requirements the user didn't ask for. Don't mention lf; the
 runner handles branches, worktrees, commits and PRs as configured.
 
-## 3. Create the task with `lf add`
+## 3. Create the task with `{lf} add`
 
-Always use `lf add`, never a hand-written file in `tasks/`. `lf add`
+Always use `{lf} add`, never a hand-written file in `{home}/tasks/`. It
 validates the task before creating it, picks a unique id, and stores
 `created_at`, so `lf run` never sees a half-written task.
 
 ```sh
-lf add --repo ~/Projects/myapp --created-by agent --on-finish pr <<'EOF'
+{lf} add --repo ~/Projects/myapp --created-by agent --on-finish pr <<'EOF'
 Fix the redirect loop after login when the session cookie has expired.
 
 Reproduce: log in, delete the `session` cookie, reload /dashboard. The
@@ -71,7 +74,7 @@ Options (all optional except `--repo`):
 | `--id <id>` | File name and id: `a-z`, `0-9`, `-`. Default: derived from the prompt's first line. Pass a short descriptive one. |
 | `--branch <name>` | Default `lf/<id>`. |
 | `--no-worktree` | Work directly in the repo checkout. |
-| `--agent`, `--model` | See step 1. |
+| `--agent <name>`, `--model <id>` | See step 1. |
 | `--mode headless\|interactive` | |
 | `--on-finish none\|commit\|push\|pr` | |
 | `--retries <n>`, `--retry-delay 5m`, `--timeout 2h` | |
@@ -83,8 +86,8 @@ fix them and run it again.
 
 ## 4. Recurring work: schedules
 
-For "every night", "each Monday" and the like, write `schedules/<id>.md`
-yourself. Use the same fields as a task, plus a quoted 5-field `cron` in
+For "every night", "each Monday" and the like, write
+`{home}/schedules/<id>.md` yourself. Use the same fields as a task, plus a quoted 5-field `cron` in
 local time. The body is the prompt, written as in step 2.
 
 ```markdown
@@ -99,25 +102,25 @@ created_by: agent
 Update dependencies to their latest compatible versions...
 ```
 
-Then run `lf validate schedules/<id>.md` and fix anything it reports.
-Use an id that doesn't already exist in `schedules/`. The schedule first
+Then run `{lf} validate {home}/schedules/<id>.md` and fix anything it
+reports. Use an id that doesn't already exist in `{home}/schedules/`. The schedule first
 fires at the next matching time after `lf run` sees it.
 
 ## 5. Changing or dropping queued work
 
-- Check the current state with `lf ls` (or read the file) first.
+- Check the current state with `{lf} ls` (or read the file) first.
 - **Pending tasks** and **schedules**: you may edit the prompt and the fields
-  from step 1, then run `lf validate <file>`. To pause a schedule, set
+  from step 1, then run `{lf} validate <file>`. To pause a schedule, set
   `enabled: false`.
 - Change a status only with these commands, and confirm with the user first:
-  `lf cancel <id>` (pending or running), `lf retry <id>` (failed, cancelled
-  or needs_review: requeues it), `lf done <id>` (runs `on_finish`, e.g. opens
-  the PR) and `lf fail <id> -r "<why>"`. The `error:` field and
-  `logs/<id>.<attempt>.log` show why a task failed.
+  `{lf} cancel <id>` (pending or running), `{lf} retry <id>` (failed,
+  cancelled or needs_review: requeues it), `{lf} done <id>` (runs
+  `on_finish`, e.g. opens the PR) and `{lf} fail <id> -r "<why>"`. The
+  `error:` field and `{home}/logs/<id>.<attempt>.log` show why a task failed.
 - Never edit fields lf writes (`status`, `attempts`, `started_at`,
   `finished_at`, `exit_code`, `tmux_window`, `error`, `last_enqueued_at`),
   and never delete task files.
-- Don't edit `running` tasks, or anything in `archive/`, `logs/` or
+- Don't edit `running` tasks, or anything in `{home}/archive/`, `logs/` or
   `worktrees/`.
 
 ## 6. Report back

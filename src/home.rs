@@ -12,8 +12,8 @@ pub struct Home {
 impl Home {
     pub fn resolve(flag: Option<PathBuf>) -> Result<Self> {
         let root = match flag.or_else(|| std::env::var_os("LF_HOME").map(PathBuf::from)) {
-            Some(p) => expand_tilde(&p),
-            None => home_dir()?.join(".loompa-forge"),
+            Some(p) => std::path::absolute(expand_tilde(&p))?,
+            None => default_root()?,
         };
         Ok(Self { root })
     }
@@ -46,8 +46,15 @@ impl Home {
         self.root.join("worktrees")
     }
 
-    pub fn skill_path(&self) -> PathBuf {
-        self.root.join(".claude/skills/lf-tasks/SKILL.md")
+    /// Whether this is `~/.loompa-forge`, which `lf` finds without
+    /// `--home` or `$LF_HOME`.
+    pub fn is_default(&self) -> bool {
+        default_root().is_ok_and(|d| d == self.root)
+    }
+
+    /// The `lf-tasks` skill's folder.
+    pub fn skill_dir(&self) -> PathBuf {
+        self.root.join(".agents/skills/lf-tasks")
     }
 
     pub fn dirs(&self) -> [PathBuf; 5] {
@@ -83,7 +90,11 @@ impl Home {
     }
 }
 
-fn home_dir() -> Result<PathBuf> {
+fn default_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".loompa-forge"))
+}
+
+pub fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("$HOME is not set")

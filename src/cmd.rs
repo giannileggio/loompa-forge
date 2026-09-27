@@ -6,64 +6,106 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, Local};
 
-use crate::config::{Config, DEFAULT_CONFIG_TOML};
+use crate::config::{Config, default_config_toml, installed_presets};
 use crate::frontmatter;
 use crate::home::{Home, contract_tilde, expand_tilde};
 use crate::schedule::Schedule;
+use crate::skill;
 use crate::spec::{Mode, OnFinish, TaskSpec, slugify, validate_id};
 use crate::task::{Task, now};
 
-const AGENTS_MD: &str = include_str!("../assets/AGENTS.md");
-const SKILL_MD: &str = include_str!("../assets/SKILL.md");
-const FORMAT_MD: &str = include_str!("../docs/FORMAT.md");
-const GENERATED: &str = "<!-- Written by `lf init`, which overwrites it: don't edit. -->\n\n";
+#[derive(clap::Args)]
+pub struct InitArgs {
+    /// Default agent for tasks that don't name one: any [agents.*] preset.
+    /// Asked (or detected from $PATH) if omitted. Only used for a new
+    /// config.toml.
+    #[arg(long)]
+    agent: Option<String>,
+    /// Make the lf-tasks skill available in every project.
+    #[arg(long, overrides_with = "no_global_skill")]
+    global_skill: bool,
+    /// Don't, and remove the links a previous --global-skill made.
+    #[arg(long)]
+    no_global_skill: bool,
+}
 
-pub fn init(home: &Home) -> Result<()> {
+pub fn init(home: &Home, args: InitArgs) -> Result<()> {
     for dir in home.dirs() {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    // The user's to edit: written once.
-    write_if_missing(&home.config_path(), DEFAULT_CONFIG_TOML)?;
-    write_if_missing(&home.root().join("AGENTS.md"), AGENTS_MD)?;
-    write_if_missing(&home.root().join("CLAUDE.md"), "@AGENTS.md\n")?;
-    // lf's own: refreshed so they match this binary.
-    overwrite(
-        &home.root().join("FORMAT.md"),
-        &format!("{GENERATED}{FORMAT_MD}"),
-    )?;
-    overwrite(&home.skill_path(), &with_generated_note(SKILL_MD))?;
+    let config = home.config_path();
+    if config.exists() {
+        println!("kept existing {}", config.display());
+    } else {
+        let agent = choose_agent(args.agent)?;
+        std::fs::write(&config, default_config_toml(agent.as_deref()))
+            .with_context(|| format!("writing {}", config.display()))?;
+        println!("wrote {}", config.display());
+    }
+    skill::install_in_home(home)?;
+    let global = match (args.global_skill, args.no_global_skill) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    };
+    skill::set_global(home, global)?;
     println!("initialized {}", home.root().display());
     Ok(())
 }
 
-fn write_if_missing(path: &Path, contents: &str) -> Result<()> {
-    if path.exists() {
-        println!("kept existing {}", path.display());
-    } else {
-        std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-        println!("wrote {}", path.display());
+/// The default agent for a new config: the one given, the only preset on
+/// $PATH, or the user's pick among several.
+fn choose_agent(given: Option<String>) -> Result<Option<String>> {
+    let presets = Config::default();
+    if let Some(a) = given {
+        if !presets.agents.contains_key(&a) {
+            let known: Vec<_> = presets.agents.keys().map(String::as_str).collect();
+            bail!(
+                "--agent `{a}` is not a preset ({}); define it in config.toml and set defaults.agent there",
+                known.join(", ")
+            );
+        }
+        return Ok(Some(a));
     }
-    Ok(())
-}
-
-fn overwrite(path: &Path, contents: &str) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let found = installed_presets();
+    match found.as_slice() {
+        [] => {
+            println!("no preset agent found on $PATH; set `agent` under [defaults] in config.toml");
+            Ok(None)
+        }
+        [one] => {
+            println!("default agent: {one} (the only one found on $PATH)");
+            Ok(Some(one.to_string()))
+        }
+        [first, ..] if !std::io::stdin().is_terminal() => {
+            println!(
+                "default agent: {first} (found {}; change it in config.toml)",
+                found.join(", ")
+            );
+            Ok(Some(first.to_string()))
+        }
+        _ => {
+            for (i, name) in found.iter().enumerate() {
+                println!("  {}) {name}", i + 1);
+            }
+            loop {
+                let answer = skill::prompt("Default agent for new tasks [1]: ")?;
+                let pick = if answer.is_empty() {
+                    Some(0)
+                } else {
+                    answer
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .or_else(|| found.iter().position(|f| *f == answer))
+                };
+                match pick.and_then(|i| found.get(i)) {
+                    Some(name) => return Ok(Some(name.to_string())),
+                    None => println!("enter a number from 1 to {}, or a name", found.len()),
+                }
+            }
+        }
     }
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    println!("wrote {}", path.display());
-    Ok(())
-}
-
-/// Puts the note after the skill's frontmatter, which must stay first.
-fn with_generated_note(skill: &str) -> String {
-    let body_start = skill
-        .strip_prefix("---\n")
-        .and_then(|rest| rest.find("\n---\n"))
-        .map(|i| i + "---\n".len() + "\n---\n".len())
-        .expect("assets/SKILL.md starts with frontmatter");
-    let (frontmatter, body) = skill.split_at(body_start);
-    format!("{frontmatter}\n{GENERATED}{}", body.trim_start())
 }
 
 pub fn ls(home: &Home, archive: bool, schedules: bool) -> Result<()> {
@@ -100,7 +142,11 @@ pub fn ls(home: &Home, archive: bool, schedules: bool) -> Result<()> {
             when,
             contract_tilde(&eff.repo),
             t.effective_branch(&config).unwrap_or_else(|| "-".into()),
-            format!("{}/{}", eff.agent, eff.model),
+            match (eff.agent, eff.model) {
+                (Some(a), Some(m)) => format!("{a}/{m}"),
+                (Some(a), None) => a,
+                (None, _) => "-".into(),
+            },
         ]);
     }
     print_table(&rows);
@@ -341,33 +387,5 @@ fn print_table(rows: &[Vec<String>]) {
             .map(|(cell, w)| format!("{cell:<w$}"))
             .collect();
         println!("{}", line.join("  ").trim_end());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn init_keeps_user_files_and_refreshes_its_own() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home::resolve(Some(dir.path().to_path_buf())).unwrap();
-        init(&home).unwrap();
-
-        let skill = std::fs::read_to_string(home.skill_path()).unwrap();
-        assert!(skill.starts_with("---\nname: lf-tasks\n"));
-        assert!(skill.contains("---\n\n<!-- Written by `lf init`"));
-        assert!(frontmatter::has_key(&skill, "description"));
-
-        let agents = dir.path().join("AGENTS.md");
-        std::fs::write(&agents, "mine").unwrap();
-        std::fs::write(home.skill_path(), "stale").unwrap();
-        init(&home).unwrap();
-        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "mine");
-        assert_eq!(std::fs::read_to_string(home.skill_path()).unwrap(), skill);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(),
-            "@AGENTS.md\n"
-        );
     }
 }

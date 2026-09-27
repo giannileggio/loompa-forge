@@ -78,8 +78,9 @@ pub struct Effective {
     pub repo: PathBuf,
     pub branch: Option<String>,
     pub worktree: bool,
-    pub agent: String,
-    pub model: String,
+    pub agent: Option<String>,
+    /// The task's model. The agent's own `model` applies if this is unset.
+    pub model: Option<String>,
     pub mode: Mode,
     pub on_finish: OnFinish,
     pub retries: u32,
@@ -93,8 +94,8 @@ impl TaskSpec {
             repo: expand_tilde(&self.repo),
             branch: self.branch.clone(),
             worktree: self.worktree.unwrap_or(defaults.worktree),
-            agent: self.agent.clone().unwrap_or_else(|| defaults.agent.clone()),
-            model: self.model.clone().unwrap_or_else(|| defaults.model.clone()),
+            agent: self.agent.clone().or_else(|| defaults.agent.clone()),
+            model: self.model.clone(),
             mode: self.mode.unwrap_or(defaults.mode),
             on_finish: self.on_finish.unwrap_or(defaults.on_finish),
             retries: self.retries.unwrap_or(defaults.retries),
@@ -121,13 +122,25 @@ impl TaskSpec {
                 eff.repo.display()
             ));
         }
-        if !config.agents.contains_key(&eff.agent) {
-            let known: Vec<_> = config.agents.keys().map(String::as_str).collect();
-            out.push(format!(
-                "unknown agent `{}` (configured: {})",
-                eff.agent,
-                known.join(", ")
-            ));
+        let known = || {
+            let names: Vec<_> = config.agents.keys().map(String::as_str).collect();
+            names.join(", ")
+        };
+        match eff.agent.as_deref().map(|a| (a, config.agents.get(a))) {
+            None => out.push(format!(
+                "no agent: set `agent` (one of {}) here or under [defaults] in config.toml",
+                known()
+            )),
+            Some((name, None)) => {
+                out.push(format!("unknown agent `{name}` (configured: {})", known()))
+            }
+            Some((name, Some(agent))) => {
+                if eff.model.is_some() && agent.model_args.is_empty() {
+                    out.push(format!(
+                        "agent `{name}` has no `model_args` in config.toml, so `model` can't be passed to it"
+                    ));
+                }
+            }
         }
         if let Some(b) = &self.branch
             && (b.is_empty() || b.contains(char::is_whitespace))
@@ -218,11 +231,45 @@ mod tests {
             retry_delay: None,
             timeout: None,
         };
-        let d = Defaults::default();
+        let d = Defaults {
+            agent: Some("codex".into()),
+            ..Defaults::default()
+        };
         let eff = spec.resolve(&d);
-        assert_eq!(eff.model, "custom");
+        assert_eq!(eff.model.as_deref(), Some("custom"));
         assert_eq!(eff.retries, 5);
-        assert_eq!(eff.agent, d.agent);
+        assert_eq!(eff.agent.as_deref(), Some("codex"));
         assert_eq!(eff.timeout, d.timeout);
+    }
+
+    #[test]
+    fn agent_problems() {
+        let spec = TaskSpec {
+            repo: "/tmp".into(),
+            branch: None,
+            worktree: Some(false),
+            agent: None,
+            model: None,
+            mode: None,
+            on_finish: None,
+            retries: None,
+            retry_delay: None,
+            timeout: None,
+        };
+        let mut config = Config::default();
+        assert!(spec.problems(&config)[0].starts_with("no agent"));
+
+        config.agents.get_mut("codex").unwrap().model_args.clear();
+        let spec = TaskSpec {
+            agent: Some("codex".into()),
+            model: Some("m".into()),
+            ..spec
+        };
+        assert!(spec.problems(&config)[0].contains("no `model_args`"));
+        let spec = TaskSpec {
+            agent: Some("nope".into()),
+            ..spec
+        };
+        assert!(spec.problems(&config)[0].starts_with("unknown agent"));
     }
 }

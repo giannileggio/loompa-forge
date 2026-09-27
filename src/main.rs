@@ -7,6 +7,7 @@ mod git;
 mod home;
 mod run;
 mod schedule;
+mod skill;
 mod spec;
 mod task;
 mod tmux;
@@ -31,8 +32,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create the data folder and a default config.toml.
-    Init,
+    /// Create the data folder, a config.toml, and the files agents use to
+    /// write tasks. Safe to re-run: refreshes lf's own files.
+    Init(cmd::InitArgs),
     /// List tasks (or archived tasks, or schedules).
     Ls {
         #[arg(long, conflicts_with = "schedules")]
@@ -95,7 +97,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let home = Home::resolve(cli.home)?;
     match cli.command {
-        Command::Init => cmd::init(&home)?,
+        Command::Init(args) => cmd::init(&home, args)?,
         Command::Ls { archive, schedules } => cmd::ls(&home, archive, schedules)?,
         Command::Add(args) => cmd::add(&home, *args)?,
         Command::Validate { files } => return cmd::validate(&home, files),

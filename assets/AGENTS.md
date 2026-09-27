@@ -5,7 +5,7 @@ Users open an agent here and ask things like "add a task to fix the login
 redirect in ~/Projects/myapp tonight" or "every Monday, update deps in myapp".
 
 To create, schedule, edit or cancel tasks, follow the `lf-tasks` skill:
-`.claude/skills/lf-tasks/SKILL.md`. Read it even if your agent doesn't load
+`.agents/skills/lf-tasks/SKILL.md`. Read it even if your agent doesn't load
 skills automatically. The file format is in `FORMAT.md`.
 
 Layout:
