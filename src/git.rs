@@ -78,6 +78,17 @@ pub fn remove_worktree(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether `name` is a branch name git will actually accept, per
+/// `git check-ref-format`: no whitespace or control characters, no `..`,
+/// `~`, `^`, `:`, `?`, `*`, `[`, no `@{`, no leading/trailing/doubled `/`,
+/// no trailing `.` or `.lock`. Needs no repository.
+pub fn valid_branch_name(name: &str) -> bool {
+    Command::new("git")
+        .args(["check-ref-format", &format!("refs/heads/{name}")])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 pub fn has_changes(dir: &Path) -> Result<bool> {
     Ok(!git(dir, &["status", "--porcelain"])?.trim().is_empty())
 }
@@ -228,6 +239,27 @@ mod tests {
         let log = git(p, &["log", "-1", "--format=%B"]).unwrap();
         assert!(log.starts_with("Add a file\n\nAdd a file\n\nWith details."));
         assert!(log.contains("lf task: t"));
+    }
+
+    #[test]
+    fn validates_branch_names() {
+        for ok in ["fix/login", "valid-name123", "a"] {
+            assert!(valid_branch_name(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "",
+            " ",
+            "a b",
+            "..",
+            "trailing.",
+            "trailing/",
+            "a//b",
+            "ends.lock",
+            "a~b",
+            "@{x}",
+        ] {
+            assert!(!valid_branch_name(bad), "{bad:?} should be invalid");
+        }
     }
 
     #[test]

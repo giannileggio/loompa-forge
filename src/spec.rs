@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Defaults};
+use crate::git;
 use crate::home::expand_tilde;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -143,7 +144,7 @@ impl TaskSpec {
             }
         }
         if let Some(b) = &self.branch
-            && (b.is_empty() || b.contains(char::is_whitespace))
+            && !git::valid_branch_name(b)
         {
             out.push(format!("invalid branch name `{b}`"));
         }
@@ -271,5 +272,35 @@ mod tests {
             ..spec
         };
         assert!(spec.problems(&config)[0].starts_with("unknown agent"));
+    }
+
+    #[test]
+    fn rejects_branch_names_git_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let spec = TaskSpec {
+            repo: dir.path().into(),
+            branch: Some("bad branch".into()),
+            worktree: Some(false),
+            agent: Some("codex".into()),
+            model: None,
+            mode: None,
+            on_finish: None,
+            retries: None,
+            retry_delay: None,
+            timeout: None,
+        };
+        let config = Config::default();
+        assert!(
+            spec.problems(&config)
+                .iter()
+                .any(|p| p.contains("invalid branch name"))
+        );
+
+        let spec = TaskSpec {
+            branch: Some("fix/login".into()),
+            ..spec
+        };
+        assert!(spec.problems(&config).is_empty());
     }
 }
