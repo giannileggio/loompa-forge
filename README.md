@@ -15,9 +15,11 @@ Because the format is plain Markdown, you can write tasks by hand, with
 
 ## Status
 
-Early scaffold. Working now: `init`, `add`, `ls`, `validate`.
-Next: the runner (`lf run`, tmux, worktrees), the scheduler, `lf done|fail|cancel|retry|attach`,
-and an agent skill for authoring tasks.
+Working now: `init`, `add`, `ls`, `validate`, and `lf run` (the runner and
+scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`).
+Next: `lf done|fail|cancel|retry|attach` (interactive tasks currently end as
+`needs_review` when their session closes), worktree cleanup, and an agent
+skill for authoring tasks.
 
 ## Install
 
@@ -37,6 +39,17 @@ lf ls                # queue
 lf ls --schedules    # schedules with their next run
 lf ls --archive      # finished tasks
 lf validate          # check every task and schedule file
+
+lf run               # run the queue until Ctrl-C (rescans every poll_interval)
+lf run --once        # one pass: enqueue due schedules, reap finished tasks, start new ones
+tmux attach -t loompa   # watch running tasks, one window each
 ```
+
+`lf run` starts each task in a window of the `loompa` tmux session, inside
+`~/.loompa-forge/worktrees/<id>` (a git worktree on the task's branch) unless
+`worktree: false`. It respects `max_parallel` and `max_parallel_per_repo`,
+retries failures after `retry_delay`, kills attempts that exceed `timeout`,
+runs `on_finish` on success, and moves finished tasks to `archive/`. Each
+attempt's output is saved to `logs/<id>.<attempt>.log`.
 
 See [docs/FORMAT.md](docs/FORMAT.md) for the file formats.

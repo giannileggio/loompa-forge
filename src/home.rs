@@ -42,8 +42,18 @@ impl Home {
         self.root.join("logs")
     }
 
-    pub fn dirs(&self) -> [PathBuf; 4] {
-        [self.tasks(), self.schedules(), self.archive(), self.logs()]
+    pub fn worktrees(&self) -> PathBuf {
+        self.root.join("worktrees")
+    }
+
+    pub fn dirs(&self) -> [PathBuf; 5] {
+        [
+            self.tasks(),
+            self.schedules(),
+            self.archive(),
+            self.logs(),
+            self.worktrees(),
+        ]
     }
 
     /// Fails with a helpful message if `lf init` has not been run.

@@ -8,7 +8,7 @@ use chrono::{DateTime, FixedOffset, Local};
 
 use crate::config::{Config, DEFAULT_CONFIG_TOML};
 use crate::frontmatter;
-use crate::home::{Home, contract_tilde};
+use crate::home::{Home, contract_tilde, expand_tilde};
 use crate::schedule::Schedule;
 use crate::spec::{Mode, OnFinish, TaskSpec, slugify, validate_id};
 use crate::task::{Task, now};
@@ -173,8 +173,9 @@ pub fn add(home: &Home, args: AddArgs) -> Result<()> {
         ),
     };
 
+    let repo = std::path::absolute(expand_tilde(&args.repo))?;
     let spec = TaskSpec {
-        repo: args.repo,
+        repo: PathBuf::from(contract_tilde(&repo)),
         branch: args.branch,
         worktree: args.no_worktree.then_some(false),
         agent: args.agent,
@@ -208,7 +209,7 @@ fn id_taken(home: &Home, id: &str) -> bool {
     home.tasks().join(&file).exists() || home.archive().join(&file).exists()
 }
 
-fn unique_id(home: &Home, base: &str) -> String {
+pub fn unique_id(home: &Home, base: &str) -> String {
     (1..)
         .map(|n| {
             if n == 1 {
@@ -268,7 +269,7 @@ fn validate_file(config: &Config, path: &Path) -> Result<Vec<String>> {
     })
 }
 
-fn md_files(dir: &Path) -> Result<Vec<PathBuf>> {
+pub fn md_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("reading {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))

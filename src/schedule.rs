@@ -49,6 +49,11 @@ impl Schedule {
         Self::parse(&text)
     }
 
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let text = frontmatter::render(self, &self.prompt)?;
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    }
+
     pub fn cron(&self) -> Result<Cron> {
         self.cron
             .parse::<Cron>()
@@ -60,6 +65,13 @@ impl Schedule {
         self.cron()?
             .find_next_occurrence(&after, false)
             .map_err(|e| anyhow::anyhow!("cron `{}` has no next run: {e}", self.cron))
+    }
+
+    /// The latest firing at or before `at`.
+    pub fn latest_at_or_before(&self, at: DateTime<Local>) -> Result<DateTime<Local>> {
+        self.cron()?
+            .find_previous_occurrence(&at, true)
+            .map_err(|e| anyhow::anyhow!("cron `{}` has no previous run: {e}", self.cron))
     }
 
     pub fn problems(&self, config: &Config, path: Option<&Path>) -> Vec<String> {
@@ -109,6 +121,18 @@ Update dependencies and run the tests.
         let next = s.next_after(from).unwrap();
         assert_eq!((next.hour(), next.minute()), (2, 0));
         assert!(next > from);
+    }
+
+    #[test]
+    fn finds_latest_firing() {
+        let s = Schedule::parse(SAMPLE).unwrap();
+        let at = Local.with_ymd_and_hms(2026, 9, 27, 10, 0, 0).unwrap();
+        let latest = s.latest_at_or_before(at).unwrap();
+        assert_eq!(
+            latest,
+            Local.with_ymd_and_hms(2026, 9, 27, 2, 0, 0).unwrap()
+        );
+        assert_eq!(s.latest_at_or_before(latest).unwrap(), latest, "inclusive");
     }
 
     #[test]

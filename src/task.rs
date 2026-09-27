@@ -140,6 +140,11 @@ impl Task {
         Ok(())
     }
 
+    pub fn save(&self, path: &Path) -> Result<()> {
+        std::fs::write(path, self.to_markdown()?)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+
     /// Branch the task runs on: explicit, or `lf/<id>` when using a worktree.
     pub fn effective_branch(&self, config: &Config) -> Option<String> {
         let eff = self.spec.resolve(&config.defaults);

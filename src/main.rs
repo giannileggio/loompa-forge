@@ -1,10 +1,13 @@
 mod cmd;
 mod config;
 mod frontmatter;
+mod git;
 mod home;
+mod run;
 mod schedule;
 mod spec;
 mod task;
+mod tmux;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -39,6 +42,19 @@ enum Command {
     Add(Box<cmd::AddArgs>),
     /// Check task/schedule files against the format. Checks all if none given.
     Validate { files: Vec<PathBuf> },
+    /// Enqueue due schedules and run pending tasks in tmux, until interrupted.
+    Run {
+        /// Do a single pass and exit.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Launch a task's agent in the current process (used by `lf run`).
+    #[command(hide = true)]
+    Exec {
+        id: String,
+        #[arg(long)]
+        status_file: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -59,6 +75,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Ls { archive, schedules } => cmd::ls(&home, archive, schedules)?,
         Command::Add(args) => cmd::add(&home, *args)?,
         Command::Validate { files } => return cmd::validate(&home, files),
+        Command::Run { once } => run::run(&home, once)?,
+        Command::Exec { id, status_file } => return run::exec(&home, &id, &status_file),
     }
     Ok(ExitCode::SUCCESS)
 }

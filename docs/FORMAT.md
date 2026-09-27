@@ -8,7 +8,8 @@ All state lives under one folder: `$LF_HOME`, default `~/.loompa-forge`.
   tasks/         queue: one <id>.md per task
   schedules/     recurring task templates: one <id>.md per schedule
   archive/       finished tasks, moved out of tasks/
-  logs/          one log per task run
+  logs/          <id>.<attempt>.log (pane output) and .exit (exit status) per run
+  worktrees/     <id>/: the git worktree a task runs in (kept after it finishes)
 ```
 
 Tasks and schedules are Markdown files with a YAML frontmatter block. The
@@ -37,7 +38,7 @@ Add a regression test.
 | Field          | Required | Default (config `[defaults]`) | Meaning |
 |----------------|----------|-------------------------------|---------|
 | `id`           | yes      | —                 | `a-z`, `0-9`, `-`, max 64 chars. Must equal the file name without `.md`. |
-| `repo`         | yes      | —                 | Folder the task runs in. `~` is expanded. |
+| `repo`         | yes      | —                 | Folder the task runs in: absolute, or starting with `~`. |
 | `branch`       | no       | `lf/<id>` if `worktree` | Branch to work on. |
 | `worktree`     | no       | `true`            | Run in a dedicated git worktree for the branch. |
 | `agent`        | no       | `claude`          | Name of an agent defined in `config.toml` `[agents.*]`. |
@@ -67,6 +68,16 @@ Don't edit these by hand. Use `lf` commands to change the status.
 `needs_review` means an interactive session ended without signalling
 `lf done` or `lf fail`.
 
+A failed attempt (non-zero exit, signal, timeout, or a start error such as a
+worktree that can't be created) goes back to `pending` with `scheduled_at`
+pushed out by `retry_delay` while retries remain; then it's `failed`. A task
+that doesn't pass `lf validate` when its turn comes is failed without
+running. `timeout` applies to headless tasks only. If `on_finish` fails after
+the agent succeeded, the task is `failed` without a retry; its worktree
+keeps the work.
+
+The agent runs with `LF_HOME` and `LF_TASK_ID` set.
+
 ## Schedule — `schedules/<id>.md`
 
 A schedule has the same fields as a task (except the ones loompa-forge writes
@@ -89,8 +100,11 @@ on_finish: pr
 Update dependencies, run the test suite, and fix any breakage.
 ```
 
-Each time the schedule fires, loompa-forge creates a task in `tasks/` with the
-schedule's fields and prompt and sets `created_by: schedule:<id>`.
+Each time the schedule fires, `lf run` creates a task `<id>-<YYYYMMDD-HHMM>`
+in `tasks/` with the schedule's fields and prompt and sets
+`created_by: schedule:<id>`. The first time `lf run` sees a schedule it only
+records `last_enqueued_at`; it fires from then on. Firings missed while
+`lf run` wasn't running collapse into one task, not one per missed slot.
 
 ## Config — `config.toml`
 

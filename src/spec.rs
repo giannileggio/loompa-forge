@@ -108,7 +108,12 @@ impl TaskSpec {
         let mut out = Vec::new();
         let eff = self.resolve(&config.defaults);
 
-        if !eff.repo.is_dir() {
+        if eff.repo.is_relative() {
+            out.push(format!(
+                "repo `{}` must be an absolute path or start with `~`",
+                self.repo.display()
+            ));
+        } else if !eff.repo.is_dir() {
             out.push(format!("repo `{}` does not exist", eff.repo.display()));
         } else if !eff.repo.join(".git").exists() && (eff.worktree || eff.branch.is_some()) {
             out.push(format!(
