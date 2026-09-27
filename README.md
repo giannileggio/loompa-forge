@@ -11,15 +11,19 @@ Queue and run coding-agent tasks defined as Markdown files.
   moves finished tasks to `archive/`.
 
 Because the format is plain Markdown, you can write tasks by hand, with
-`lf add`, or by asking an agent to create them.
+`lf add`, or by asking an agent: open it in `~/.loompa-forge` and say "add a
+task to fix the login redirect in ~/Projects/myapp tonight, open a PR". `lf
+init` puts an `AGENTS.md` (plus a `CLAUDE.md` that imports it) and an
+`lf-tasks` skill there, which teach the agent to write a self-contained prompt
+and queue it with `lf add`.
 
 ## Status
 
-Working now: `init`, `add`, `ls`, `validate`, and `lf run` (the runner and
-scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`).
-Next: `lf done|fail|cancel|retry|attach` (interactive tasks currently end as
-`needs_review` when their session closes), worktree cleanup, and an agent
-skill for authoring tasks.
+Working now: `init`, `add`, `ls`, `validate`, `lf run` (the runner and
+scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`), and
+the agent skill for writing tasks. Next: `lf done|fail|cancel|retry|attach`
+(interactive tasks currently end as `needs_review` when their session
+closes) and worktree cleanup.
 
 ## Install
 

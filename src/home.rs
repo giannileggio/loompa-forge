@@ -46,6 +46,10 @@ impl Home {
         self.root.join("worktrees")
     }
 
+    pub fn skill_path(&self) -> PathBuf {
+        self.root.join(".claude/skills/lf-tasks/SKILL.md")
+    }
+
     pub fn dirs(&self) -> [PathBuf; 5] {
         [
             self.tasks(),

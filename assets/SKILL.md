@@ -1,0 +1,122 @@
+---
+name: lf-tasks
+description: Create, schedule, edit or cancel loompa-forge (lf) tasks, the Markdown files that queue work for coding agents. Use when the user asks to add, queue or schedule a task, to set up something recurring ("every night...", "each Monday..."), or to change or drop queued work.
+---
+
+# Managing lf tasks
+
+This folder (`$LF_HOME`, usually `~/.loompa-forge`) holds the queue. The full
+format is in `FORMAT.md` next to `config.toml`. Read it if anything here is
+unclear.
+
+A task is run later, by another agent, in the target repo. That agent has no
+access to this conversation. Your job is to turn what the user said into a
+task it can carry out.
+
+## 1. Work out the details
+
+- **Repo**: an absolute path or one starting with `~`. If the user gives only
+  a name, look for it in the `REPO` column of `lf ls`, `lf ls --archive` and
+  `lf ls --schedules`, or check that `~/Projects/<name>` exists. If it's still
+  ambiguous, ask. Don't guess.
+- **What to do**: if the request is vague ("clean up the auth code"), ask
+  one or two questions before you queue it. A vague task wastes a whole run.
+- **When**: now (the default), at a given time, after a delay, or on a
+  recurring schedule (see section 4).
+- **Only set fields the user asked for.** Anything you leave out falls back
+  to `[defaults]` in `config.toml`, which is what the user expects. Examples:
+  "open a PR" → `--on-finish pr`; "I'll drive it" → `--mode interactive`;
+  "use opus" → `--model` with the full model name. The allowed `--agent`
+  values are the `[agents.*]` sections in `config.toml`.
+
+## 2. Write the prompt
+
+The prompt is the task body. Write it for an engineer who is new to the repo
+and can't ask questions (headless runs have nobody to answer):
+
+- **Goal**: the outcome, in one or two sentences.
+- **Context**: everything the user gave you, such as error messages, file
+  names, issue links and reproduction steps. Copy them, don't summarize.
+- **Constraints**: anything the user wants done, or left alone.
+- **Done when**: how to check the work, e.g. which tests or commands must
+  pass, and "add a regression test" if it's a bug fix.
+- **If blocked**: tell the agent to stop and explain what's missing instead
+  of guessing.
+
+Don't invent requirements the user didn't ask for. Don't mention lf; the
+runner handles branches, worktrees, commits and PRs as configured.
+
+## 3. Create the task with `lf add`
+
+Always use `lf add`, never a hand-written file in `tasks/`. `lf add`
+validates the task before creating it, picks a unique id, and stores
+`created_at`, so `lf run` never sees a half-written task.
+
+```sh
+lf add --repo ~/Projects/myapp --created-by agent --on-finish pr <<'EOF'
+Fix the redirect loop after login when the session cookie has expired.
+
+Reproduce: log in, delete the `session` cookie, reload /dashboard. The
+browser loops between /login and /dashboard.
+
+Done when: the expired-session case redirects to /login once, and a
+regression test covers it. `npm test` passes.
+EOF
+```
+
+Options (all optional except `--repo`):
+
+| Option | Meaning |
+|--------|---------|
+| `--id <id>` | File name and id: `a-z`, `0-9`, `-`. Default: derived from the prompt's first line. Pass a short descriptive one. |
+| `--branch <name>` | Default `lf/<id>`. |
+| `--no-worktree` | Work directly in the repo checkout. |
+| `--agent`, `--model` | See step 1. |
+| `--mode headless\|interactive` | |
+| `--on-finish none\|commit\|push\|pr` | |
+| `--retries <n>`, `--retry-delay 5m`, `--timeout 2h` | |
+| `--at <RFC 3339>` | e.g. `2026-09-28T02:00:00+02:00`. Use the local UTC offset (`date +%:z`). |
+| `--in <duration>` | e.g. `2h`. |
+
+On success it prints the new file's path. On failure it lists the problems;
+fix them and run it again.
+
+## 4. Recurring work: schedules
+
+For "every night", "each Monday" and the like, write `schedules/<id>.md`
+yourself. Use the same fields as a task, plus a quoted 5-field `cron` in
+local time. The body is the prompt, written as in step 2.
+
+```markdown
+---
+id: weekly-deps
+cron: "0 6 * * 1"
+repo: ~/Projects/myapp
+on_finish: pr
+created_by: agent
+---
+
+Update dependencies to their latest compatible versions...
+```
+
+Then run `lf validate schedules/<id>.md` and fix anything it reports.
+Use an id that doesn't already exist in `schedules/`. The schedule first
+fires at the next matching time after `lf run` sees it.
+
+## 5. Changing or dropping queued work
+
+- Check the current state with `lf ls` (or read the file) first.
+- **Pending tasks** and **schedules**: you may edit the prompt and the fields
+  from step 1, then run `lf validate <file>`. To drop a pending task, delete
+  its file, but confirm with the user first. To pause a schedule, set
+  `enabled: false`.
+- Never edit fields lf writes (`status`, `attempts`, `started_at`,
+  `finished_at`, `exit_code`, `tmux_window`, `error`, `last_enqueued_at`).
+- Don't touch tasks that are `running`, or anything in `archive/`, `logs/` or
+  `worktrees/`.
+
+## 6. Report back
+
+Tell the user the task id, when it will start, and what happens when it
+finishes (e.g. "opens a PR on `lf/fix-login-redirect`"). If it should start
+soon, remind them that tasks only run while `lf run` is running.

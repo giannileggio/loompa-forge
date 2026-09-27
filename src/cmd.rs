@@ -13,19 +13,57 @@ use crate::schedule::Schedule;
 use crate::spec::{Mode, OnFinish, TaskSpec, slugify, validate_id};
 use crate::task::{Task, now};
 
+const AGENTS_MD: &str = include_str!("../assets/AGENTS.md");
+const SKILL_MD: &str = include_str!("../assets/SKILL.md");
+const FORMAT_MD: &str = include_str!("../docs/FORMAT.md");
+const GENERATED: &str = "<!-- Written by `lf init`, which overwrites it: don't edit. -->\n\n";
+
 pub fn init(home: &Home) -> Result<()> {
     for dir in home.dirs() {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let config = home.config_path();
-    if config.exists() {
-        println!("kept existing {}", config.display());
-    } else {
-        std::fs::write(&config, DEFAULT_CONFIG_TOML)?;
-        println!("wrote {}", config.display());
-    }
+    // The user's to edit: written once.
+    write_if_missing(&home.config_path(), DEFAULT_CONFIG_TOML)?;
+    write_if_missing(&home.root().join("AGENTS.md"), AGENTS_MD)?;
+    write_if_missing(&home.root().join("CLAUDE.md"), "@AGENTS.md\n")?;
+    // lf's own: refreshed so they match this binary.
+    overwrite(
+        &home.root().join("FORMAT.md"),
+        &format!("{GENERATED}{FORMAT_MD}"),
+    )?;
+    overwrite(&home.skill_path(), &with_generated_note(SKILL_MD))?;
     println!("initialized {}", home.root().display());
     Ok(())
+}
+
+fn write_if_missing(path: &Path, contents: &str) -> Result<()> {
+    if path.exists() {
+        println!("kept existing {}", path.display());
+    } else {
+        std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+fn overwrite(path: &Path, contents: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+/// Puts the note after the skill's frontmatter, which must stay first.
+fn with_generated_note(skill: &str) -> String {
+    let body_start = skill
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---\n"))
+        .map(|i| i + "---\n".len() + "\n---\n".len())
+        .expect("assets/SKILL.md starts with frontmatter");
+    let (frontmatter, body) = skill.split_at(body_start);
+    format!("{frontmatter}\n{GENERATED}{}", body.trim_start())
 }
 
 pub fn ls(home: &Home, archive: bool, schedules: bool) -> Result<()> {
@@ -303,5 +341,33 @@ fn print_table(rows: &[Vec<String>]) {
             .map(|(cell, w)| format!("{cell:<w$}"))
             .collect();
         println!("{}", line.join("  ").trim_end());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_keeps_user_files_and_refreshes_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::resolve(Some(dir.path().to_path_buf())).unwrap();
+        init(&home).unwrap();
+
+        let skill = std::fs::read_to_string(home.skill_path()).unwrap();
+        assert!(skill.starts_with("---\nname: lf-tasks\n"));
+        assert!(skill.contains("---\n\n<!-- Written by `lf init`"));
+        assert!(frontmatter::has_key(&skill, "description"));
+
+        let agents = dir.path().join("AGENTS.md");
+        std::fs::write(&agents, "mine").unwrap();
+        std::fs::write(home.skill_path(), "stale").unwrap();
+        init(&home).unwrap();
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(home.skill_path()).unwrap(), skill);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(),
+            "@AGENTS.md\n"
+        );
     }
 }

@@ -10,7 +10,15 @@ All state lives under one folder: `$LF_HOME`, default `~/.loompa-forge`.
   archive/       finished tasks, moved out of tasks/
   logs/          <id>.<attempt>.log (pane output) and .exit (exit status) per run
   worktrees/     <id>/: the git worktree a task runs in (kept after it finishes)
+  AGENTS.md      guide for an agent opened in this folder (CLAUDE.md imports it)
+  FORMAT.md      this document
+  .claude/skills/lf-tasks/SKILL.md   how an agent creates and edits tasks
 ```
+
+Open your coding agent in this folder and ask it to "add a task to..." or
+"every night, ...": the `lf-tasks` skill tells it how. `lf init` keeps your
+`AGENTS.md` and `CLAUDE.md` if they exist, and rewrites `FORMAT.md` and the
+skill so they match the installed `lf`.
 
 Tasks and schedules are Markdown files with a YAML frontmatter block. The
 **body is the prompt** given to the agent. Unknown frontmatter keys are
@@ -108,7 +116,6 @@ records `last_enqueued_at`; it fires from then on. Firings missed while
 
 ## Config — `config.toml`
 
-`lf init` writes a commented copy of every default. See
-[`src/config.rs`](../src/config.rs) (`DEFAULT_CONFIG_TOML`). Agents are argv
+`lf init` writes a `config.toml` with every default, commented. Agents are argv
 lists with `{prompt}`, `{model}` and `{id}` placeholders. No shell is involved,
 so prompts need no quoting.
