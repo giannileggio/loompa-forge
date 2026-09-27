@@ -56,3 +56,32 @@ fn due(home: &Home) -> bool {
     }
     stale
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::home::Home;
+
+    fn home() -> (tempfile::TempDir, Home) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::resolve(Some(dir.path().to_path_buf())).unwrap();
+        (dir, home)
+    }
+
+    #[test]
+    fn due_once_a_day_and_touches_the_marker() {
+        let (_dir, home) = home();
+        let marker = home.root().join(".update-checked");
+
+        assert!(due(&home), "no marker yet: due");
+        assert!(marker.is_file());
+        assert!(!due(&home), "just touched: not due again");
+
+        let old = SystemTime::now() - CHECK_INTERVAL - Duration::from_secs(1);
+        std::fs::File::open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(due(&home), "marker older than the interval: due again");
+    }
+}
