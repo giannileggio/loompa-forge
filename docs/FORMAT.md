@@ -9,7 +9,7 @@ All state lives under one folder: `$LF_HOME`, default `~/.loompa-forge`.
   schedules/     recurring task templates: one <id>.md per schedule
   archive/       finished tasks, moved out of tasks/
   logs/          <id>.<attempt>.log (pane output) and .exit (exit status) per run
-  worktrees/     <id>/: the git worktree a task runs in (kept after it finishes)
+  worktrees/     <id>/: the git worktree a task runs in (kept until `lf clean`)
   AGENTS.md      guide for an agent opened in this folder (CLAUDE.md imports it)
   FORMAT.md      this document
   .claude/skills/lf-tasks/SKILL.md   how an agent creates and edits tasks
@@ -89,6 +89,11 @@ Don't edit these by hand. Use `lf` commands to change the status.
 `id` defaults to `$LF_TASK_ID`, so inside a task's window a plain `lf done`
 works: the user can type `! lf done` in the agent, or the agent can run it.
 Ending a session saves its output to the attempt's log first.
+
+`lf clean` removes `worktrees/<id>` of archived `done` tasks (`--all`: any
+archived task, and worktrees with no task file; `--older-than 7d`: only
+tasks finished that long ago; `-n`: dry run). It never removes a worktree
+with uncommitted changes, and never deletes branches.
 
 `attempts` keeps counting across `lf retry`, so earlier logs are kept. That
 also means automatic retries aren't renewed: if the retried attempt fails,

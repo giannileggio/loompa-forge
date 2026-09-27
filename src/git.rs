@@ -66,6 +66,18 @@ pub fn checkout_branch(repo: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Removes the linked worktree at `path` from whichever repo owns it. Its
+/// branch stays. Like `git worktree remove`, refuses if it has changes.
+pub fn remove_worktree(path: &Path) -> Result<()> {
+    let common = git(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let p = path.to_str().context("worktree path is not valid UTF-8")?;
+    git(Path::new(common.trim()), &["worktree", "remove", p])?;
+    Ok(())
+}
+
 pub fn has_changes(dir: &Path) -> Result<bool> {
     Ok(!git(dir, &["status", "--porcelain"])?.trim().is_empty())
 }
@@ -169,6 +181,26 @@ mod tests {
 
         std::fs::remove_dir_all(&wt).unwrap();
         std::fs::remove_dir_all(&wt2).unwrap();
+    }
+
+    #[test]
+    fn removes_clean_worktrees_and_keeps_branches() {
+        let repo = repo();
+        let wt = repo.path().join("wt");
+        ensure_worktree(repo.path(), &wt, "lf/gone").unwrap();
+
+        std::fs::write(wt.join("f.txt"), "x").unwrap();
+        assert!(remove_worktree(&wt).is_err(), "dirty worktrees stay");
+        std::fs::remove_file(wt.join("f.txt")).unwrap();
+
+        remove_worktree(&wt).unwrap();
+        assert!(!wt.exists());
+        assert!(branch_exists(repo.path(), "lf/gone"));
+        assert!(
+            !git(repo.path(), &["worktree", "list"])
+                .unwrap()
+                .contains("wt")
+        );
     }
 
     #[test]

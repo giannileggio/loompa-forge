@@ -1,3 +1,4 @@
+mod clean;
 mod cmd;
 mod config;
 mod control;
@@ -67,6 +68,10 @@ enum Command {
     Retry { id: String },
     /// Attach to a running task's tmux window (or the whole session).
     Attach { id: Option<String> },
+    /// Remove the worktrees of finished tasks (done only, unless --all).
+    ///
+    /// Worktrees with uncommitted changes are kept. Branches are never deleted.
+    Clean(clean::CleanArgs),
     /// Launch a task's agent in the current process (used by `lf run`).
     #[command(hide = true)]
     Exec {
@@ -100,6 +105,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Cancel { id } => control::cancel(&home, id)?,
         Command::Retry { id } => control::retry(&home, &id)?,
         Command::Attach { id } => control::attach(&home, id)?,
+        Command::Clean(args) => clean::clean(&home, args)?,
         Command::Exec { id, status_file } => return run::exec(&home, &id, &status_file),
     }
     Ok(ExitCode::SUCCESS)

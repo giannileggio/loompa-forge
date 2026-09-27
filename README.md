@@ -21,8 +21,8 @@ and queue it with `lf add`.
 
 Working now: `init`, `add`, `ls`, `validate`, `lf run` (the runner and
 scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`),
-`done|fail|cancel|retry|attach`, and the agent skill for writing tasks.
-Next: worktree cleanup.
+`done|fail|cancel|retry|attach`, `clean`, and the agent skill for writing
+tasks.
 
 ## Install
 
@@ -51,6 +51,9 @@ lf done [id]         # finish a task: runs on_finish, archives it
 lf fail [id] -r why  # give up on it, without retrying
 lf cancel [id]       # drop a pending or running task
 lf retry <id>        # requeue a failed/cancelled/needs_review task
+
+lf clean             # remove worktrees of done tasks (-n: dry run)
+lf clean --all --older-than 7d   # ...and of failed/cancelled ones, a week on
 ```
 
 Inside a task's window, `id` defaults to that task, so an interactive
