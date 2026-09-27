@@ -120,3 +120,57 @@ pub fn contract_tilde(path: &Path) -> String {
     }
     path.display().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_and_contract_tilde_round_trip() {
+        let home = home_dir().unwrap();
+
+        assert_eq!(expand_tilde(Path::new("~/foo/bar")), home.join("foo/bar"));
+        let absolute = Path::new("/not/under/home");
+        assert_eq!(expand_tilde(absolute), absolute);
+
+        assert_eq!(contract_tilde(&home.join("foo/bar")), "~/foo/bar");
+        assert_eq!(contract_tilde(absolute), "/not/under/home");
+    }
+
+    #[test]
+    fn resolve_uses_the_given_path_and_is_not_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::resolve(Some(dir.path().to_path_buf())).unwrap();
+
+        assert_eq!(home.root(), dir.path());
+        assert!(!home.is_default());
+        assert_eq!(home.config_path(), dir.path().join("config.toml"));
+        assert_eq!(home.skill_dir(), dir.path().join(".agents/skills/lf-tasks"));
+        assert_eq!(
+            home.dirs(),
+            [
+                dir.path().join("tasks"),
+                dir.path().join("schedules"),
+                dir.path().join("archive"),
+                dir.path().join("logs"),
+                dir.path().join("worktrees"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_expands_a_leading_tilde() {
+        let home = Home::resolve(Some(PathBuf::from("~/.loompa-forge-test"))).unwrap();
+        assert_eq!(home.root(), home_dir().unwrap().join(".loompa-forge-test"));
+    }
+
+    #[test]
+    fn ensure_initialized_checks_for_the_tasks_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::resolve(Some(dir.path().to_path_buf())).unwrap();
+
+        assert!(home.ensure_initialized().is_err());
+        std::fs::create_dir_all(home.tasks()).unwrap();
+        assert!(home.ensure_initialized().is_ok());
+    }
+}
