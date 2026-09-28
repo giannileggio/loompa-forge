@@ -1,16 +1,20 @@
-//! `lf web`: a read-only, Sidekiq-style dashboard over the queue.
+//! `lf web`: a Sidekiq-style dashboard over the queue, with actions.
 //!
-//! Serves one HTML shell and a `/api/state` JSON endpoint the page polls.
-//! No mutating routes: acting on a task still goes through `lf` itself.
+//! Serves one HTML shell, a `/api/state` JSON endpoint the page polls, a
+//! `/api/tasks/<id>/logs` endpoint, and `/api/tasks/<id>/{done,fail,cancel,retry}`
+//! POST routes that call straight into the same code `lf done|fail|cancel|retry`
+//! use. Only binds to 127.0.0.1, so anyone who can reach it can already run
+//! `lf` locally; no separate auth.
 
 use std::cmp::Reverse;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
-use tiny_http::{Header, Response, Server};
+use serde::{Deserialize, Serialize};
+use tiny_http::{Header, Method, Response, Server};
 
 use crate::cmd::md_files;
 use crate::config::Config;
+use crate::control;
 use crate::home::{Home, contract_tilde};
 use crate::schedule::Schedule;
 use crate::task::{Status, Task, fmt_cost, fmt_tokens, now};
@@ -23,6 +27,7 @@ pub struct WebArgs {
 }
 
 const INDEX_HTML: &str = include_str!("web_dashboard.html");
+const ACTIONS: [&str; 4] = ["done", "fail", "cancel", "retry"];
 
 pub fn serve(home: &Home, args: WebArgs) -> Result<()> {
     home.ensure_initialized()?;
@@ -32,15 +37,43 @@ pub fn serve(home: &Home, args: WebArgs) -> Result<()> {
         .with_context(|| format!("starting `lf web` on {addr}"))?;
     println!("lf web on http://{addr}  (Ctrl-C to stop)");
 
-    for request in server.incoming_requests() {
-        let (status, content_type, body) = match request.url() {
-            "/" => (200, "text/html; charset=utf-8", INDEX_HTML.to_string()),
-            "/api/state" => match state_json(home) {
-                Ok(json) => (200, "application/json", json),
-                Err(e) => (500, "text/plain", format!("error: {e:#}")),
+    for mut request in server.incoming_requests() {
+        let url = request.url().to_string();
+        let path = url.split('?').next().unwrap_or("").to_string();
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        let (status, content_type, body) = match request.method() {
+            Method::Get => match segments.as_slice() {
+                [] => (200, "text/html; charset=utf-8", INDEX_HTML.to_string()),
+                ["api", "state"] => match state_json(home) {
+                    Ok(json) => (200, "application/json", json),
+                    Err(e) => (500, "application/json", json_err(&e)),
+                },
+                ["api", "tasks", id, "logs"] => {
+                    let attempt = query_param(&url, "attempt").and_then(|v| v.parse().ok());
+                    match control::logs(home, id, attempt) {
+                        Ok(log) => (200, "application/json", json_log(&log)),
+                        Err(e) => (404, "application/json", json_err(&e)),
+                    }
+                }
+                _ => (404, "text/plain", "not found".to_string()),
             },
+            Method::Post => {
+                let mut body_buf = String::new();
+                let _ = request.as_reader().read_to_string(&mut body_buf);
+                match segments.as_slice() {
+                    ["api", "tasks", id, action] if ACTIONS.contains(action) => {
+                        match perform_action(home, id, action, &body_buf) {
+                            Ok(()) => (200, "application/json", "{\"ok\":true}".to_string()),
+                            Err(e) => (400, "application/json", json_err(&e)),
+                        }
+                    }
+                    _ => (404, "text/plain", "not found".to_string()),
+                }
+            }
             _ => (404, "text/plain", "not found".to_string()),
         };
+
         let header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
             .expect("static content-type is valid ASCII");
         let response = Response::from_string(body)
@@ -49,6 +82,47 @@ pub fn serve(home: &Home, args: WebArgs) -> Result<()> {
         let _ = request.respond(response);
     }
     Ok(())
+}
+
+#[derive(Deserialize, Default)]
+struct ActionBody {
+    reason: Option<String>,
+}
+
+/// Runs one of the `ACTIONS` against a task, the same way `lf <action> <id>`
+/// would. `body` is the POST body, parsed for `fail`'s optional `reason`.
+fn perform_action(home: &Home, id: &str, action: &str, body: &str) -> Result<()> {
+    match action {
+        "done" => control::done(home, Some(id.to_string())),
+        "fail" => {
+            let reason = serde_json::from_str::<ActionBody>(body)
+                .ok()
+                .and_then(|b| b.reason)
+                .filter(|r| !r.trim().is_empty());
+            control::fail(home, Some(id.to_string()), reason)
+        }
+        "cancel" => control::cancel(home, Some(id.to_string())),
+        "retry" => control::retry(home, id),
+        _ => unreachable!("route only matches ACTIONS"),
+    }
+}
+
+fn json_err(e: &anyhow::Error) -> String {
+    serde_json::to_string(&serde_json::json!({ "error": format!("{e:#}") }))
+        .unwrap_or_else(|_| "{\"error\":\"internal error\"}".to_string())
+}
+
+fn json_log(log: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "log": log }))
+        .unwrap_or_else(|_| "{\"log\":\"\"}".to_string())
+}
+
+fn query_param<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+    let query = url.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then_some(v)
+    })
 }
 
 #[derive(Serialize)]
@@ -183,4 +257,40 @@ fn fmt_time(t: chrono::DateTime<chrono::FixedOffset>) -> String {
     t.with_timezone(&chrono::Local)
         .format("%Y-%m-%d %H:%M")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_param_finds_and_misses() {
+        assert_eq!(
+            query_param("/api/tasks/x/logs?attempt=2", "attempt"),
+            Some("2")
+        );
+        assert_eq!(query_param("/api/tasks/x/logs?a=1&b=2", "b"), Some("2"));
+        assert_eq!(query_param("/api/tasks/x/logs", "attempt"), None);
+        assert_eq!(query_param("/api/tasks/x/logs?a=1", "attempt"), None);
+    }
+
+    #[test]
+    fn action_body_parses_reason_or_defaults() {
+        let with: ActionBody = serde_json::from_str(r#"{"reason":"bad approach"}"#).unwrap();
+        assert_eq!(with.reason.as_deref(), Some("bad approach"));
+
+        let empty: ActionBody = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.reason, None);
+    }
+
+    #[test]
+    fn json_err_and_json_log_produce_valid_json() {
+        let err = json_err(&anyhow::anyhow!("boom"));
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(v["error"], "boom");
+
+        let log = json_log("line one\nline two");
+        let v: serde_json::Value = serde_json::from_str(&log).unwrap();
+        assert_eq!(v["log"], "line one\nline two");
+    }
 }

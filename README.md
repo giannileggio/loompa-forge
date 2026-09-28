@@ -24,8 +24,8 @@ the skill into your global skill folders, so you can queue work from any repo.
 
 Working now: `init`, `add`, `ls`, `validate`, `lf run` (the runner and
 scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`),
-`done|fail|cancel|retry|attach`, `logs`, `clean`, `web` (a read-only
-dashboard), and the agent skill for writing tasks.
+`done|fail|cancel|retry|attach`, `logs`, `clean`, `web` (a dashboard you can
+also act from), and the agent skill for writing tasks.
 
 ## Install
 
@@ -89,9 +89,12 @@ retries failures after `retry_delay`, kills attempts that exceed `timeout`,
 runs `on_finish` on success, and moves finished tasks to `archive/`. Each
 attempt's output is saved to `logs/<id>.<attempt>.log`.
 
-`lf web` serves a local, read-only dashboard (queue, running, archive and
-schedules, refreshed every couple of seconds) — a Sidekiq-style view of the
-same state `lf ls` prints. It only reads task files; use `lf` itself to act
-on a task.
+`lf web` serves a local dashboard (queue, running, archive and schedules,
+refreshed every couple of seconds) — a Sidekiq-style view of the same state
+`lf ls` prints. Each task row offers the buttons that make sense for its
+status (done, fail, cancel, retry) plus a log viewer, calling the same code
+as `lf done|fail|cancel|retry` and `lf logs`. It only binds to
+`127.0.0.1`, so anyone who can reach it could already run `lf` locally
+themselves; there's no separate login.
 
 See [docs/FORMAT.md](docs/FORMAT.md) for the file formats.

@@ -325,6 +325,64 @@ fn http_get(port: u16, path: &str) -> String {
     }
 }
 
+/// A raw POST over TCP, once the server is already known to be up.
+fn http_post(port: u16, path: &str, body: &str) -> String {
+    use std::io::Read as _;
+    use std::net::TcpStream;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    resp
+}
+
+#[test]
+fn web_actions_mutate_tasks_through_the_api() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init(home.path());
+    add(home.path(), repo.path(), "w1", "do it");
+
+    let port = 18338u16;
+    let mut child = lf(home.path())
+        .args(["web", "--port", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    http_get(port, "/"); // waits for the server to come up
+
+    let cancel = http_post(port, "/api/tasks/w1/cancel", "");
+    assert!(cancel.starts_with("HTTP/1.1 200"), "{cancel}");
+    assert!(cancel.contains("\"ok\":true"));
+
+    let state = http_get(port, "/api/state");
+    assert!(state.contains("\"cancelled\":1"));
+    assert!(state.contains("\"pending\":0"));
+
+    let retry = http_post(port, "/api/tasks/w1/retry", "");
+    assert!(retry.starts_with("HTTP/1.1 200"), "{retry}");
+    let state = http_get(port, "/api/state");
+    assert!(state.contains("\"pending\":1"));
+
+    let bad = http_post(port, "/api/tasks/w1/fail", "");
+    assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+    assert!(bad.contains("\"error\""));
+
+    let logs = http_get(port, "/api/tasks/w1/logs");
+    assert!(logs.starts_with("HTTP/1.1 404"), "{logs}");
+    assert!(logs.contains("hasn't started"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 #[test]
 fn web_serves_the_dashboard_and_state() {
     let home = tempfile::tempdir().unwrap();

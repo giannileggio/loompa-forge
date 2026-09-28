@@ -115,6 +115,41 @@
   .badge.needs_review { background: var(--review); }
 
   .empty { padding: 30px; text-align: center; color: var(--muted); }
+
+  .actions { display: flex; gap: 6px; white-space: nowrap; }
+  .actions button {
+    font-size: 11px; padding: 4px 8px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    cursor: pointer;
+  }
+  .actions button:hover { background: rgba(127,127,127,.12); }
+  .actions button.danger { color: var(--failed); border-color: var(--failed); }
+  .actions button:disabled { opacity: .4; cursor: default; }
+
+  .overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5);
+    align-items: center; justify-content: center; padding: 20px; z-index: 10;
+  }
+  .overlay.active { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    width: min(800px, 100%); max-height: 80vh; display: flex; flex-direction: column;
+  }
+  .modal header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+  }
+  .modal header h2 { font-size: 13px; margin: 0; }
+  .modal header button { background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; }
+  .modal pre {
+    margin: 0; padding: 16px; overflow: auto; font-size: 12px; white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; padding: 10px 16px; border-radius: 6px;
+    background: var(--failed); color: #fff; font-size: 13px; display: none; z-index: 20;
+  }
+  .toast.active { display: block; }
 </style>
 </head>
 <body>
@@ -140,6 +175,17 @@
   <section class="panel" id="panel-schedules"></section>
 </main>
 
+<div class="overlay" id="logs-overlay">
+  <div class="modal">
+    <header>
+      <h2 class="mono" id="logs-title">logs</h2>
+      <button id="logs-close" aria-label="Close">&times;</button>
+    </header>
+    <pre id="logs-body">loading&hellip;</pre>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
 <script>
 const STAT_LABELS = [
   ["pending", "Pending"], ["running", "Running"], ["done", "Done"],
@@ -158,6 +204,28 @@ function taskTable(rows, cols) {
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
+// Which action buttons make sense for a task in this status.
+const ACTIONS_FOR_STATUS = {
+  pending: ["cancel"],
+  running: ["done", "fail", "cancel"],
+  needs_review: ["done", "fail", "retry"],
+  failed: ["retry"],
+  cancelled: ["retry"],
+  done: [],
+};
+
+const ACTION_LABELS = { done: "Done", fail: "Fail", cancel: "Cancel", retry: "Retry", logs: "Logs" };
+const DANGER_ACTIONS = new Set(["fail", "cancel"]);
+const CONFIRM_ACTIONS = new Set(["fail", "cancel"]);
+
+function actionButtons(r) {
+  const acts = [...(ACTIONS_FOR_STATUS[r.status] || [])];
+  acts.push("logs"); // always offered; the endpoint reports if there's nothing yet
+  return acts.map(a =>
+    `<button data-id="${r.id}" data-action="${a}" class="${DANGER_ACTIONS.has(a) ? "danger" : ""}">${ACTION_LABELS[a]}</button>`
+  ).join("");
+}
+
 const TASK_COLS = [
   { key: "id", label: "ID", mono: true },
   { key: "status", label: "Status", render: r => badge(r.status) },
@@ -167,6 +235,7 @@ const TASK_COLS = [
   { key: "agent", label: "Agent" },
   { key: "tokens", label: "Tokens", mono: true },
   { key: "cost", label: "Cost", mono: true },
+  { key: "actions", label: "", render: r => `<div class="actions">${actionButtons(r)}</div>` },
 ];
 
 const SCHEDULE_COLS = [
@@ -208,6 +277,71 @@ document.getElementById("tabs").addEventListener("click", (e) => {
   if (!btn) return;
   for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b === btn);
   for (const p of document.querySelectorAll(".panel")) p.classList.toggle("active", p.id === `panel-${btn.dataset.tab}`);
+});
+
+let toastTimer = null;
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.add("active");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("active"), 4000);
+}
+
+const logsOverlay = document.getElementById("logs-overlay");
+const logsTitle = document.getElementById("logs-title");
+const logsBody = document.getElementById("logs-body");
+
+async function showLogs(id) {
+  logsTitle.textContent = id;
+  logsBody.textContent = "loading…";
+  logsOverlay.classList.add("active");
+  try {
+    const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/logs`);
+    const data = await res.json();
+    logsBody.textContent = res.ok ? (data.log || "(empty)") : `error: ${data.error}`;
+  } catch (e) {
+    logsBody.textContent = `error: ${e}`;
+  }
+}
+
+document.getElementById("logs-close").addEventListener("click", () => logsOverlay.classList.remove("active"));
+logsOverlay.addEventListener("click", (e) => { if (e.target === logsOverlay) logsOverlay.classList.remove("active"); });
+
+async function runAction(id, action) {
+  let body;
+  if (action === "fail") {
+    const reason = prompt(`Reason for failing ${id} (optional):`, "");
+    if (reason === null) return; // cancelled
+    body = JSON.stringify({ reason });
+  }
+  if (CONFIRM_ACTIONS.has(action) && !confirm(`${ACTION_LABELS[action]} ${id}?`)) return;
+
+  try {
+    const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/${action}`, {
+      method: "POST",
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body,
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      toast(`${id}: ${data.error || "action failed"}`);
+    }
+  } catch (e) {
+    toast(`${id}: ${e}`);
+  }
+  refresh();
+}
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-action]");
+  if (!btn) return;
+  const { id, action } = btn.dataset;
+  if (action === "logs") {
+    showLogs(id);
+  } else {
+    runAction(id, action);
+  }
 });
 
 refresh();
