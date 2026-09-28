@@ -13,7 +13,7 @@ use crate::cmd::md_files;
 use crate::config::Config;
 use crate::home::{Home, contract_tilde};
 use crate::schedule::Schedule;
-use crate::task::{Status, Task, now};
+use crate::task::{Status, Task, fmt_cost, fmt_tokens, now};
 
 #[derive(clap::Args)]
 pub struct WebArgs {
@@ -59,6 +59,8 @@ struct Row {
     repo: String,
     branch: String,
     agent: String,
+    tokens: String,
+    cost: String,
 }
 
 #[derive(Serialize)]
@@ -172,6 +174,8 @@ fn to_row(t: &Task, config: &Config) -> Row {
             (Some(a), None) => a,
             (None, _) => "-".into(),
         },
+        tokens: fmt_tokens(t.tokens_in, t.tokens_out),
+        cost: fmt_cost(t.cost_usd),
     }
 }
 

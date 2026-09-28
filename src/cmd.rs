@@ -12,7 +12,7 @@ use crate::home::{Home, contract_tilde, expand_tilde};
 use crate::schedule::Schedule;
 use crate::skill;
 use crate::spec::{Mode, OnFinish, TaskSpec, slugify, validate_id};
-use crate::task::{Task, now};
+use crate::task::{Task, fmt_cost, fmt_tokens, now};
 
 #[derive(clap::Args)]
 pub struct InitArgs {
@@ -148,7 +148,9 @@ fn ls_once(home: &Home, archive: bool, schedules: bool) -> Result<()> {
     }
     tasks.sort_by_key(|t| (t.scheduled_at.or(t.created_at), t.id.clone()));
 
-    let mut rows = vec![row(["ID", "STATUS", "WHEN", "REPO", "BRANCH", "AGENT"])];
+    let mut rows = vec![row([
+        "ID", "STATUS", "WHEN", "REPO", "BRANCH", "AGENT", "TOKENS", "COST",
+    ])];
     for t in &tasks {
         let eff = t.spec.resolve(&config.defaults);
         let when = match (t.finished_at, t.started_at, t.scheduled_at) {
@@ -166,6 +168,8 @@ fn ls_once(home: &Home, archive: bool, schedules: bool) -> Result<()> {
                 (Some(a), None) => a,
                 (None, _) => "-".into(),
             },
+            fmt_tokens(t.tokens_in, t.tokens_out),
+            fmt_cost(t.cost_usd),
         ]);
     }
     print_table(&rows);

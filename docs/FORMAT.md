@@ -8,7 +8,8 @@ All state lives under one folder: `$LF_HOME`, default `~/.loompa-forge`.
   tasks/         queue: one <id>.md per task
   schedules/     recurring task templates: one <id>.md per schedule
   archive/       finished tasks, moved out of tasks/
-  logs/          <id>.<attempt>.log (pane output) and .exit (exit status) per run
+  logs/          <id>.<attempt>.log (pane output), .exit (exit status) and
+                 .usage (token/cost usage, if the agent reports it) per run
   worktrees/     <id>/: the git worktree a task runs in (kept until `lf clean`)
   AGENTS.md      guide for any agent opened in this folder
   CLAUDE.md, GEMINI.md   `@AGENTS.md`, for agents that don't read AGENTS.md
@@ -80,6 +81,8 @@ Don't edit these by hand. Use `lf` commands to change the status.
 | `exit_code`   | Headless mode only. |
 | `tmux_window` | Where the task is or was running. |
 | `error`       | Last failure reason. |
+| `tokens_in`, `tokens_out` | Token usage, if the agent's headless mode reports it (built in for `claude`). |
+| `cost_usd`    | Cost in USD, same condition. |
 
 `needs_review` means an interactive session ended without signalling
 `lf done` or `lf fail`.
@@ -170,3 +173,12 @@ model = "sonnet"                      # optional: this agent's default model
 placeholders. No shell is involved, so prompts need no quoting. A task's
 `model` (else the agent's `model`) fills `{model}` in `model_args`; with
 neither, nothing is added and the agent picks its own model.
+
+### Token/cost usage
+
+If a headless run's stdout is a JSON object with a `usage` field, `lf`
+records it on the task as `tokens_in`/`tokens_out`/`cost_usd` (`lf ls` and
+`lf web` show them too). The `claude` preset asks for this with
+`--output-format json`; other agents report nothing unless their own
+headless flags produce the same shape. Interactive mode never reports
+usage: it keeps a real terminal for the human running it.

@@ -37,8 +37,12 @@ timeout = "2h"
 # Headless runs can't answer permission prompts: add each agent's
 # auto-approve flags (e.g. claude "--permission-mode", "acceptEdits";
 # codex "--full-auto"; gemini "--yolo") to suit your trust level.
+#
+# claude's headless preset asks for `--output-format json`: lf parses that
+# final object for token/cost usage (see `tokens_in`/`tokens_out`/`cost_usd`
+# in FORMAT.md). Drop the flag and lf just won't record usage for it.
 [agents.claude]
-headless = ["claude", "-p", "{prompt}"]
+headless = ["claude", "-p", "{prompt}", "--output-format", "json"]
 interactive = ["claude", "{prompt}"]
 model_args = ["--model", "{model}"]
 
@@ -156,7 +160,7 @@ impl Default for Config {
 const PRESETS: &[(&str, &[&str], &[&str])] = &[
     (
         "claude",
-        &["claude", "-p", "{prompt}"],
+        &["claude", "-p", "{prompt}", "--output-format", "json"],
         &["claude", "{prompt}"],
     ),
     (

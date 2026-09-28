@@ -64,6 +64,15 @@ pub struct Task {
     pub tmux_window: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Total input tokens the agent reported, if it reports usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    /// Total output tokens the agent reported, if it reports usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    /// Cost in USD the agent reported, if it reports usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 
     #[serde(skip)]
     pub prompt: String,
@@ -81,6 +90,9 @@ const TASK_KEYS: &[&str] = &[
     "exit_code",
     "tmux_window",
     "error",
+    "tokens_in",
+    "tokens_out",
+    "cost_usd",
 ];
 
 fn is_zero(n: &u32) -> bool {
@@ -90,6 +102,33 @@ fn is_zero(n: &u32) -> bool {
 /// Current local time, to the second (keeps the files readable).
 pub fn now() -> DateTime<FixedOffset> {
     Local::now().fixed_offset().trunc_subsecs(0)
+}
+
+/// `"1.2k in / 340 out"`, or `"-"` if the agent didn't report token usage.
+pub fn fmt_tokens(tokens_in: Option<u64>, tokens_out: Option<u64>) -> String {
+    match (tokens_in, tokens_out) {
+        (None, None) => "-".into(),
+        (i, o) => format!(
+            "{} in / {} out",
+            i.map_or("-".into(), fmt_count),
+            o.map_or("-".into(), fmt_count)
+        ),
+    }
+}
+
+fn fmt_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+/// `"$0.0512"`, or `"-"` if the agent didn't report a cost.
+pub fn fmt_cost(cost_usd: Option<f64>) -> String {
+    cost_usd.map_or_else(|| "-".into(), |c| format!("${c:.4}"))
 }
 
 impl Task {
@@ -107,6 +146,9 @@ impl Task {
             exit_code: None,
             tmux_window: None,
             error: None,
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
             prompt,
         }
     }
@@ -238,5 +280,21 @@ Fix the redirect loop.
         let t = Task::parse(SAMPLE).unwrap();
         let problems = t.problems(&Config::default(), Some(Path::new("tasks/other.md")));
         assert!(problems.iter().any(|p| p.contains("does not match id")));
+    }
+
+    #[test]
+    fn formats_tokens() {
+        assert_eq!(fmt_tokens(None, None), "-");
+        assert_eq!(fmt_tokens(Some(120), Some(80)), "120 in / 80 out");
+        assert_eq!(
+            fmt_tokens(Some(1500), Some(2_340_000)),
+            "1.5k in / 2.3M out"
+        );
+    }
+
+    #[test]
+    fn formats_cost() {
+        assert_eq!(fmt_cost(None), "-");
+        assert_eq!(fmt_cost(Some(0.0512)), "$0.0512");
     }
 }

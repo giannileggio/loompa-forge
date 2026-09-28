@@ -8,12 +8,14 @@
 //! own exit-status tracking (which lags behind `pane_dead`).
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Local};
+use serde::{Deserialize, Serialize};
 
 use crate::cmd::{md_files, unique_id};
 use crate::config::{Agent, Config};
@@ -53,7 +55,9 @@ pub fn run(home: &Home, once: bool) -> Result<()> {
 }
 
 /// Runs inside the task's tmux window: runs the agent, then writes how it
-/// ended to `status_file` for [`poll_running`] to pick up.
+/// ended to `status_file` for [`poll_running`] to pick up. If the agent's
+/// (headless-only) stdout is a JSON object reporting `usage`, also writes
+/// token/cost usage next to it, at [`usage_file_for`].
 pub fn exec(home: &Home, id: &str, status_file: &Path) -> Result<ExitCode> {
     let spawned = (|| {
         let config = Config::load(&home.config_path())?;
@@ -66,15 +70,23 @@ pub fn exec(home: &Home, id: &str, status_file: &Path) -> Result<ExitCode> {
             .with_context(|| format!("unknown agent `{name}`"))?;
         let model = eff.model.as_deref().or(agent.model.as_deref());
         let argv = agent_argv(agent, eff.mode, &task.prompt, model, &task.id);
-        Command::new(&argv[0])
-            .args(&argv[1..])
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .env("LF_HOME", home.root())
-            .env("LF_TASK_ID", &task.id)
+            .env("LF_TASK_ID", &task.id);
+        // Headless stdout is captured (and teed back below) so a final JSON
+        // summary can be parsed for usage. Interactive mode keeps a real,
+        // fully inherited tty: it's a live session for a human to use.
+        if eff.mode == Mode::Headless {
+            cmd.stdout(Stdio::piped());
+        }
+        let child = cmd
             .spawn()
-            .with_context(|| format!("starting `{}`", argv[0]))
+            .with_context(|| format!("starting `{}`", argv[0]))?;
+        Ok::<_, anyhow::Error>((child, eff.mode))
     })();
-    let exit = match spawned {
-        Ok(mut child) => {
+    let (exit, usage) = match spawned {
+        Ok((mut child, mode)) => {
             // Ctrl-C / Ctrl-\ in the window are meant for the agent; this
             // process must outlive it to record the status. Ignoring them
             // only after the spawn keeps the child's handlers default.
@@ -83,18 +95,48 @@ pub fn exec(home: &Home, id: &str, status_file: &Path) -> Result<ExitCode> {
                 libc::signal(libc::SIGINT, libc::SIG_IGN);
                 libc::signal(libc::SIGQUIT, libc::SIG_IGN);
             }
+            // Tee piped stdout back to our own (the tmux pane) as it
+            // arrives, so `lf attach`/`lf logs` still see it live, while
+            // also keeping a copy to parse for usage once the agent exits.
+            let stdout_thread = (mode == Mode::Headless).then(|| {
+                let mut stdout = child.stdout.take().expect("piped for headless mode");
+                std::thread::spawn(move || -> Vec<u8> {
+                    let mut out = std::io::stdout();
+                    let mut buf = [0u8; 8192];
+                    let mut captured = Vec::new();
+                    while let Ok(n) = stdout.read(&mut buf)
+                        && n > 0
+                    {
+                        let _ = out.write_all(&buf[..n]);
+                        captured.extend_from_slice(&buf[..n]);
+                    }
+                    let _ = out.flush();
+                    captured
+                })
+            });
             let status = child.wait().context("waiting for the agent")?;
-            match (status.code(), status.signal()) {
+            let captured = stdout_thread.and_then(|t| t.join().ok());
+            let exit = match (status.code(), status.signal()) {
                 (Some(code), _) => Exit::Code(code),
                 (None, Some(sig)) => Exit::Signal(sig),
                 (None, None) => Exit::Code(1),
-            }
+            };
+            let usage = captured.and_then(|out| Usage::parse(&out));
+            (exit, usage)
         }
         Err(e) => {
             eprintln!("error: {e:#}");
-            Exit::Code(127)
+            (Exit::Code(127), None)
         }
     };
+    // Written before the exit record, so a poller that sees the exit record
+    // finds any usage already there.
+    if let Some(usage) = usage {
+        let path = usage_file_for(status_file);
+        if let Err(e) = std::fs::write(&path, usage.to_json()) {
+            eprintln!("warning: could not write {}: {e:#}", path.display());
+        }
+    }
     std::fs::write(status_file, exit.to_string())
         .with_context(|| format!("writing {}", status_file.display()))?;
     Ok(match exit {
@@ -135,6 +177,63 @@ impl std::str::FromStr for Exit {
 
 fn status_file(home: &Home, id: &str, attempt: u32) -> PathBuf {
     home.logs().join(format!("{id}.{attempt}.exit"))
+}
+
+fn usage_file(home: &Home, id: &str, attempt: u32) -> PathBuf {
+    home.logs().join(format!("{id}.{attempt}.usage"))
+}
+
+/// The usage file next to a given `status_file` path (same id and attempt).
+fn usage_file_for(status_file: &Path) -> PathBuf {
+    status_file.with_extension("usage")
+}
+
+/// Token/cost usage an agent reported for one attempt, parsed from its
+/// headless stdout. Only agents whose headless mode prints a final JSON
+/// object with a `usage` field (e.g. Claude Code's `--output-format json`)
+/// report anything; other agents simply have no usage file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+struct Usage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_out: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+}
+
+impl Usage {
+    /// `None` if `bytes` isn't a JSON object reporting usage: either it
+    /// isn't valid JSON (a non-JSON agent, or a headless run that failed
+    /// before printing anything), or it has no `usage` to report.
+    fn parse(bytes: &[u8]) -> Option<Usage> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let usage = value.get("usage")?;
+        let tokens = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+        let tokens_in = tokens("input_tokens").map(|n| {
+            n + tokens("cache_creation_input_tokens").unwrap_or(0)
+                + tokens("cache_read_input_tokens").unwrap_or(0)
+        });
+        let tokens_out = tokens("output_tokens");
+        let cost_usd = value
+            .get("total_cost_usd")
+            .or_else(|| value.get("cost_usd"))
+            .and_then(serde_json::Value::as_f64);
+        (tokens_in.is_some() || tokens_out.is_some() || cost_usd.is_some()).then_some(Usage {
+            tokens_in,
+            tokens_out,
+            cost_usd,
+        })
+    }
+
+    fn to_json(self) -> String {
+        serde_json::to_string(&self).expect("Usage always serializes")
+    }
+}
+
+fn read_usage(path: &Path) -> Option<Usage> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 fn read_exit(path: &Path) -> Result<Option<Exit>> {
@@ -221,7 +320,7 @@ enum Outcome {
 
 fn poll_running(home: &Home, config: &Config, now: DateTime<FixedOffset>) -> Result<()> {
     let mut panes: HashMap<String, Vec<tmux::Pane>> = HashMap::new();
-    for (path, task) in load_tasks(home, Status::Running)? {
+    for (path, mut task) in load_tasks(home, Status::Running)? {
         let (session, window) = window_of(&task, config);
         if !panes.contains_key(&session) {
             panes.insert(session.clone(), tmux::panes(&session)?);
@@ -229,6 +328,13 @@ fn poll_running(home: &Home, config: &Config, now: DateTime<FixedOffset>) -> Res
         let pane = panes[&session].iter().find(|p| p.window == window);
         let eff = task.spec.resolve(&config.defaults);
         let exit = read_exit(&status_file(home, &task.id, task.attempts))?;
+        if exit.is_some()
+            && let Some(usage) = read_usage(&usage_file(home, &task.id, task.attempts))
+        {
+            task.tokens_in = usage.tokens_in;
+            task.tokens_out = usage.tokens_out;
+            task.cost_usd = usage.cost_usd;
+        }
         let outcome = match (exit, pane) {
             (Some(exit), _) => exit_outcome(eff.mode, exit),
             (None, None) => Outcome::Failed {
@@ -663,5 +769,31 @@ mod tests {
     fn truncates_ids_without_trailing_dash() {
         assert_eq!(truncate_id("nightly-deps", 48), "nightly-deps");
         assert_eq!(truncate_id("abc-def", 4), "abc");
+    }
+
+    #[test]
+    fn parses_claude_code_usage() {
+        let stdout = r#"{"type":"result","total_cost_usd":0.0512,"usage":{"input_tokens":120,"cache_creation_input_tokens":30,"cache_read_input_tokens":500,"output_tokens":80}}"#;
+        let usage = Usage::parse(stdout.as_bytes()).unwrap();
+        assert_eq!(usage.tokens_in, Some(120 + 30 + 500));
+        assert_eq!(usage.tokens_out, Some(80));
+        assert_eq!(usage.cost_usd, Some(0.0512));
+    }
+
+    #[test]
+    fn no_usage_for_non_json_or_usage_less_output() {
+        assert!(Usage::parse(b"plain text output, not json").is_none());
+        assert!(Usage::parse(br#"{"type":"result","result":"ok"}"#).is_none());
+    }
+
+    #[test]
+    fn usage_roundtrips_through_json() {
+        let usage = Usage {
+            tokens_in: Some(650),
+            tokens_out: Some(80),
+            cost_usd: Some(0.0512),
+        };
+        let read_back: Usage = serde_json::from_str(&usage.to_json()).unwrap();
+        assert_eq!(usage, read_back);
     }
 }
