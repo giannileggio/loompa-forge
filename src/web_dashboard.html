@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lf web</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --border: #e2e5ea;
+    --text: #1c2128;
+    --muted: #6b7280;
+    --accent: #4f46e5;
+    --pending: #6b7280;
+    --running: #2563eb;
+    --done: #16a34a;
+    --failed: #dc2626;
+    --cancelled: #9ca3af;
+    --review: #d97706;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --border: #2a2e37;
+      --text: #e6e8eb;
+      --muted: #8b93a1;
+      --accent: #818cf8;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header h1 span { color: var(--accent); }
+  header .home { color: var(--muted); font-size: 12px; }
+  header .updated { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .dot {
+    display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--done); margin-right: 6px; animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 1px;
+    background: var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  .stat {
+    background: var(--panel);
+    padding: 14px 16px;
+  }
+  .stat .n { font-size: 22px; font-weight: 600; }
+  .stat .l { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .stat.pending .n { color: var(--pending); }
+  .stat.running .n { color: var(--running); }
+  .stat.done .n { color: var(--done); }
+  .stat.failed .n { color: var(--failed); }
+  .stat.cancelled .n { color: var(--cancelled); }
+  .stat.needs_review .n { color: var(--review); }
+
+  nav {
+    display: flex; gap: 4px;
+    padding: 10px 20px 0;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  nav button {
+    background: none; border: none; cursor: pointer;
+    padding: 8px 14px; font-size: 13px; color: var(--muted);
+    border-bottom: 2px solid transparent;
+  }
+  nav button.active { color: var(--text); border-color: var(--accent); font-weight: 600; }
+  nav button .count {
+    display: inline-block; margin-left: 6px; padding: 1px 6px;
+    background: var(--border); border-radius: 999px; font-size: 11px;
+  }
+
+  main { padding: 16px 20px 40px; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(127,127,127,.06); }
+
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; color: #fff;
+  }
+  .badge.pending { background: var(--pending); }
+  .badge.running { background: var(--running); }
+  .badge.done { background: var(--done); }
+  .badge.failed { background: var(--failed); }
+  .badge.cancelled { background: var(--cancelled); }
+  .badge.needs_review { background: var(--review); }
+
+  .empty { padding: 30px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>&#9670;</span> lf web</h1>
+  <span class="home mono" id="home"></span>
+  <span class="updated"><span class="dot"></span>as of <span id="updated">-</span></span>
+</header>
+
+<div class="stats" id="stats"></div>
+
+<nav id="tabs">
+  <button data-tab="queue" class="active">Queue <span class="count" id="c-queue">0</span></button>
+  <button data-tab="running">Busy <span class="count" id="c-running">0</span></button>
+  <button data-tab="archive">Archive <span class="count" id="c-archive">0</span></button>
+  <button data-tab="schedules">Schedules <span class="count" id="c-schedules">0</span></button>
+</nav>
+
+<main>
+  <section class="panel active" id="panel-queue"></section>
+  <section class="panel" id="panel-running"></section>
+  <section class="panel" id="panel-archive"></section>
+  <section class="panel" id="panel-schedules"></section>
+</main>
+
+<script>
+const STAT_LABELS = [
+  ["pending", "Pending"], ["running", "Running"], ["done", "Done"],
+  ["failed", "Failed"], ["cancelled", "Cancelled"], ["needs_review", "Review"],
+  ["schedules", "Schedules"],
+];
+
+function badge(status) {
+  return `<span class="badge ${status}">${status.replace("_", " ")}</span>`;
+}
+
+function taskTable(rows, cols) {
+  if (rows.length === 0) return `<div class="empty">Nothing here.</div>`;
+  const head = cols.map(c => `<th>${c.label}</th>`).join("");
+  const body = rows.map(r => `<tr>${cols.map(c => `<td class="${c.mono ? "mono" : ""}">${c.render ? c.render(r) : r[c.key]}</td>`).join("")}</tr>`).join("");
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+const TASK_COLS = [
+  { key: "id", label: "ID", mono: true },
+  { key: "status", label: "Status", render: r => badge(r.status) },
+  { key: "when", label: "When" },
+  { key: "repo", label: "Repo", mono: true },
+  { key: "branch", label: "Branch", mono: true },
+  { key: "agent", label: "Agent" },
+];
+
+const SCHEDULE_COLS = [
+  { key: "id", label: "ID", mono: true },
+  { key: "enabled", label: "Enabled", render: r => r.enabled ? "yes" : "no" },
+  { key: "cron", label: "Cron", mono: true },
+  { key: "next", label: "Next run" },
+  { key: "repo", label: "Repo", mono: true },
+];
+
+async function refresh() {
+  let state;
+  try {
+    const res = await fetch("/api/state");
+    state = await res.json();
+  } catch (e) {
+    return; // keep showing the last good state
+  }
+
+  document.getElementById("home").textContent = state.home;
+  document.getElementById("updated").textContent = state.generated_at;
+
+  document.getElementById("stats").innerHTML = STAT_LABELS.map(([key, label]) =>
+    `<div class="stat ${key}"><div class="n">${state.counts[key]}</div><div class="l">${label}</div></div>`
+  ).join("");
+
+  for (const tab of ["queue", "running", "archive", "schedules"]) {
+    document.getElementById(`c-${tab}`).textContent = state[tab].length;
+  }
+
+  document.getElementById("panel-queue").innerHTML = taskTable(state.queue, TASK_COLS);
+  document.getElementById("panel-running").innerHTML = taskTable(state.running, TASK_COLS);
+  document.getElementById("panel-archive").innerHTML = taskTable(state.archive, TASK_COLS);
+  document.getElementById("panel-schedules").innerHTML = taskTable(state.schedules, SCHEDULE_COLS);
+}
+
+document.getElementById("tabs").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-tab]");
+  if (!btn) return;
+  for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b === btn);
+  for (const p of document.querySelectorAll(".panel")) p.classList.toggle("active", p.id === `panel-${btn.dataset.tab}`);
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

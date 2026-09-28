@@ -12,6 +12,7 @@ mod spec;
 mod task;
 mod tmux;
 mod update_check;
+mod web;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -91,6 +92,8 @@ enum Command {
     ///
     /// Worktrees with uncommitted changes are kept. Branches are never deleted.
     Clean(clean::CleanArgs),
+    /// Serve a read-only dashboard over the queue, until interrupted.
+    Web(web::WebArgs),
     /// Launch a task's agent in the current process (used by `lf run`).
     #[command(hide = true)]
     Exec {
@@ -134,6 +137,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Attach { id } => control::attach(&home, id)?,
         Command::Logs { id, attempt } => print!("{}", control::logs(&home, &id, attempt)?),
         Command::Clean(args) => clean::clean(&home, args)?,
+        Command::Web(args) => web::serve(&home, args)?,
         Command::Exec { id, status_file } => return run::exec(&home, &id, &status_file),
     }
     Ok(ExitCode::SUCCESS)

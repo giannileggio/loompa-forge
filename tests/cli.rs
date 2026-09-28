@@ -298,3 +298,60 @@ fn ls_watch_refreshes_until_killed() {
     );
     assert!(text.contains("\x1B[2J\x1B[H"));
 }
+
+/// A raw GET over TCP (no HTTP client dependency), retrying until the
+/// server is up. Panics if it never comes up within a few seconds.
+fn http_get(port: u16, path: &str) -> String {
+    use std::io::Read as _;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut stream) => {
+                write!(
+                    stream,
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                let mut resp = String::new();
+                stream.read_to_string(&mut resp).unwrap();
+                return resp;
+            }
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(30)),
+            Err(e) => panic!("could not connect to 127.0.0.1:{port}: {e}"),
+        }
+    }
+}
+
+#[test]
+fn web_serves_the_dashboard_and_state() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init(home.path());
+    add(home.path(), repo.path(), "w1", "do it");
+
+    let port = 18337u16;
+    let mut child = lf(home.path())
+        .args(["web", "--port", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let index = http_get(port, "/");
+    assert!(index.starts_with("HTTP/1.1 200"));
+    assert!(index.contains("lf web"));
+
+    let state = http_get(port, "/api/state");
+    assert!(state.starts_with("HTTP/1.1 200"));
+    assert!(state.contains("\"w1\""));
+    assert!(state.contains("\"pending\":1"));
+
+    let missing = http_get(port, "/nope");
+    assert!(missing.starts_with("HTTP/1.1 404"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
