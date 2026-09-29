@@ -11,7 +11,7 @@ Queue and run coding-agent tasks defined as Markdown files.
   moves finished tasks to `archive/`.
 
 It works with any CLI coding agent: presets for Claude Code, Codex, Gemini
-CLI and opencode are built in, and others are a few lines of config.
+CLI, opencode and Pi are built in, and others are a few lines of config.
 
 Because the format is plain Markdown, you can write tasks by hand, with
 `lf add`, or by asking an agent: open it in `~/.loompa-forge` and say "add a

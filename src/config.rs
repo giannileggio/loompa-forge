@@ -60,6 +60,11 @@ model_args = ["--model", "{model}"]
 headless = ["opencode", "run", "{prompt}"]
 interactive = ["opencode", "--prompt", "{prompt}"]
 model_args = ["--model", "{model}"]
+
+[agents.pi]
+headless = ["pi", "-p", "{prompt}"]
+interactive = ["pi", "{prompt}"]
+model_args = ["--model", "{model}"]
 "#;
 
 /// The config `lf init` writes, with `agent` as the default agent (left
@@ -178,6 +183,7 @@ const PRESETS: &[(&str, &[&str], &[&str])] = &[
         &["opencode", "run", "{prompt}"],
         &["opencode", "--prompt", "{prompt}"],
     ),
+    ("pi", &["pi", "-p", "{prompt}"], &["pi", "{prompt}"]),
 ];
 
 fn builtin_agents() -> BTreeMap<String, Agent> {
