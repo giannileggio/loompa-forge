@@ -193,14 +193,23 @@ const STAT_LABELS = [
   ["schedules", "Schedules"],
 ];
 
+// Task fields (branch names, repo paths, cron strings, ids, ...) come from
+// task/schedule files the user or an agent wrote, not from lf itself, so
+// they're untrusted as far as this page is concerned.
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[c]);
+}
+
 function badge(status) {
-  return `<span class="badge ${status}">${status.replace("_", " ")}</span>`;
+  return `<span class="badge ${escapeHtml(status)}">${escapeHtml(status.replace("_", " "))}</span>`;
 }
 
 function taskTable(rows, cols) {
   if (rows.length === 0) return `<div class="empty">Nothing here.</div>`;
-  const head = cols.map(c => `<th>${c.label}</th>`).join("");
-  const body = rows.map(r => `<tr>${cols.map(c => `<td class="${c.mono ? "mono" : ""}">${c.render ? c.render(r) : r[c.key]}</td>`).join("")}</tr>`).join("");
+  const head = cols.map(c => `<th>${escapeHtml(c.label)}</th>`).join("");
+  const body = rows.map(r => `<tr>${cols.map(c => `<td class="${c.mono ? "mono" : ""}">${c.render ? c.render(r) : escapeHtml(r[c.key])}</td>`).join("")}</tr>`).join("");
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
@@ -222,7 +231,7 @@ function actionButtons(r) {
   const acts = [...(ACTIONS_FOR_STATUS[r.status] || [])];
   acts.push("logs"); // always offered; the endpoint reports if there's nothing yet
   return acts.map(a =>
-    `<button data-id="${r.id}" data-action="${a}" class="${DANGER_ACTIONS.has(a) ? "danger" : ""}">${ACTION_LABELS[a]}</button>`
+    `<button data-id="${escapeHtml(r.id)}" data-action="${a}" class="${DANGER_ACTIONS.has(a) ? "danger" : ""}">${ACTION_LABELS[a]}</button>`
   ).join("");
 }
 
