@@ -74,6 +74,7 @@ lf retry <id>        # requeue a failed/cancelled/needs_review task
 
 lf clean             # remove worktrees of done tasks (-n: dry run)
 lf clean --all --older-than 7d   # ...and of failed/cancelled ones, a week on
+lf clean --archive --all --older-than 30d   # ...and their archived task files/logs
 
 lf web               # dashboard at http://127.0.0.1:7433, until Ctrl-C
 lf web --port 8080   # a different port

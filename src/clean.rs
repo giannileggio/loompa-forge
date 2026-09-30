@@ -1,4 +1,5 @@
-//! `lf clean`: remove the worktrees of finished tasks.
+//! `lf clean`: remove the worktrees of finished tasks, and optionally the
+//! archived task files and logs themselves.
 
 use std::path::Path;
 use std::time::Duration;
@@ -6,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 
+use crate::cmd::md_files;
 use crate::git;
 use crate::home::Home;
 use crate::task::{Status, Task, now};
@@ -19,12 +21,18 @@ pub struct CleanArgs {
     /// Only tasks that finished at least this long ago, e.g. 7d.
     #[arg(long, value_parser = humantime::parse_duration)]
     older_than: Option<Duration>,
+    /// Also delete the archived task file and its logs, for tasks whose
+    /// worktree is already gone (or never had one). Loses that task's
+    /// history from `lf ls --archive` / `lf web` for good.
+    #[arg(long)]
+    archive: bool,
     /// Show what would be removed without removing anything.
     #[arg(long, short = 'n')]
     dry_run: bool,
 }
 
-/// Removes `worktrees/<id>` for archived tasks that qualify. Worktrees with
+/// Removes `worktrees/<id>` for archived tasks that qualify, and with
+/// `--archive`, also the archived task file and its logs. Worktrees with
 /// uncommitted changes are always kept; branches are never deleted.
 pub fn clean(home: &Home, args: CleanArgs) -> Result<()> {
     home.ensure_initialized()?;
@@ -84,6 +92,82 @@ pub fn clean(home: &Home, args: CleanArgs) -> Result<()> {
         "{verb} {removed}, kept {kept} (in {})",
         home.worktrees().display()
     );
+
+    if args.archive {
+        prune_archive(home, &args, now)?;
+    }
+    Ok(())
+}
+
+/// Deletes archived task files (and their logs) that qualify, but only if
+/// their worktree is already gone — a worktree left behind because it had
+/// uncommitted changes keeps its task record too, so `lf clean --all` run
+/// again still explains what that worktree is.
+fn prune_archive(home: &Home, args: &CleanArgs, now: DateTime<FixedOffset>) -> Result<()> {
+    let (mut removed, mut kept) = (0, 0);
+    for path in md_files(&home.archive())? {
+        let task = Task::load(&path)?;
+        let id = task.id.clone();
+        let verdict = eligible(
+            task.status,
+            task.finished_at,
+            args.all,
+            args.older_than,
+            now,
+        )
+        .and_then(|()| {
+            if home.worktrees().join(&id).exists() {
+                Err("worktree still present".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        match verdict {
+            Err(why) => {
+                kept += 1;
+                println!("kept     {id}: {why}");
+            }
+            Ok(()) if args.dry_run => {
+                removed += 1;
+                println!("would remove {id} (archive + logs)");
+            }
+            Ok(()) => {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+                remove_logs(home, &id)?;
+                removed += 1;
+                println!("removed  {id} (archive + logs)");
+            }
+        }
+    }
+    let verb = if args.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
+    println!(
+        "{verb} {removed}, kept {kept} (in {})",
+        home.archive().display()
+    );
+    Ok(())
+}
+
+/// Removes every `logs/<id>.*` file (all attempts: `.log`, `.exit`, `.usage`).
+fn remove_logs(home: &Home, id: &str) -> Result<()> {
+    let prefix = format!("{id}.");
+    let dir = home.logs();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("removing {}", entry.path().display()))?;
+        }
+    }
     Ok(())
 }
 
@@ -137,6 +221,8 @@ fn check_clean(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::home::Home;
+    use crate::spec::TaskSpec;
 
     #[test]
     fn eligibility() {
@@ -151,5 +237,108 @@ mod tests {
         assert!(eligible(Status::Done, ago(8), false, Some(7 * day), now).is_ok());
         assert!(eligible(Status::Done, ago(2), false, Some(7 * day), now).is_err());
         assert!(eligible(Status::Done, None, false, Some(day), now).is_err());
+    }
+
+    fn home() -> (tempfile::TempDir, Home) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::resolve(Some(dir.path().to_path_buf())).unwrap();
+        for d in home.dirs() {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        (dir, home)
+    }
+
+    fn archive(home: &Home, id: &str, status: Status, finished_at: Option<DateTime<FixedOffset>>) {
+        let spec = TaskSpec {
+            repo: std::env::temp_dir(),
+            branch: None,
+            worktree: Some(false),
+            agent: None,
+            model: None,
+            mode: None,
+            on_finish: None,
+            retries: None,
+            retry_delay: None,
+            timeout: None,
+        };
+        let mut task = Task::new(id.into(), spec, "do it".into());
+        task.status = status;
+        task.finished_at = finished_at;
+        task.save(&home.archive().join(format!("{id}.md"))).unwrap();
+        for attempt in [1, 2] {
+            std::fs::write(home.logs().join(format!("{id}.{attempt}.log")), "output\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn archive_flag_prunes_eligible_task_files_and_logs() {
+        let (_d, home) = home();
+        archive(&home, "old-done", Status::Done, Some(now()));
+        archive(&home, "old-failed", Status::Failed, Some(now()));
+
+        let args = CleanArgs {
+            all: false,
+            older_than: None,
+            archive: true,
+            dry_run: false,
+        };
+        clean(&home, args).unwrap();
+
+        assert!(!home.archive().join("old-done.md").exists());
+        assert!(!home.logs().join("old-done.1.log").exists());
+        assert!(!home.logs().join("old-done.2.log").exists());
+        // Failed, without --all: kept.
+        assert!(home.archive().join("old-failed.md").exists());
+        assert!(home.logs().join("old-failed.1.log").exists());
+    }
+
+    #[test]
+    fn archive_flag_keeps_tasks_whose_worktree_is_still_present() {
+        let (_d, home) = home();
+        archive(&home, "has-worktree", Status::Done, Some(now()));
+        std::fs::create_dir_all(home.worktrees().join("has-worktree")).unwrap();
+
+        let args = CleanArgs {
+            all: false,
+            older_than: None,
+            archive: true,
+            dry_run: false,
+        };
+        clean(&home, args).unwrap();
+
+        assert!(home.archive().join("has-worktree.md").exists());
+    }
+
+    #[test]
+    fn dry_run_does_not_delete_archive_files() {
+        let (_d, home) = home();
+        archive(&home, "old-done", Status::Done, Some(now()));
+
+        let args = CleanArgs {
+            all: false,
+            older_than: None,
+            archive: true,
+            dry_run: true,
+        };
+        clean(&home, args).unwrap();
+
+        assert!(home.archive().join("old-done.md").exists());
+        assert!(home.logs().join("old-done.1.log").exists());
+    }
+
+    #[test]
+    fn without_archive_flag_task_files_are_untouched() {
+        let (_d, home) = home();
+        archive(&home, "old-done", Status::Done, Some(now()));
+
+        let args = CleanArgs {
+            all: false,
+            older_than: None,
+            archive: false,
+            dry_run: false,
+        };
+        clean(&home, args).unwrap();
+
+        assert!(home.archive().join("old-done.md").exists());
     }
 }

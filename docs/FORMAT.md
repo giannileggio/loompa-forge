@@ -110,6 +110,12 @@ archived task, and worktrees with no task file; `--older-than 7d`: only
 tasks finished that long ago; `-n`: dry run). It never removes a worktree
 with uncommitted changes, and never deletes branches.
 
+`lf clean --archive` also deletes the archived task file and its
+`logs/<id>.*` files, for any task whose worktree is already gone (or never
+had one). This loses that task's history from `lf ls --archive`/`lf web`
+for good, so it's off by default; combine it with `--all --older-than` to
+prune old history without touching anything recent.
+
 `attempts` keeps counting across `lf retry`, so earlier logs are kept. That
 also means automatic retries aren't renewed: if the retried attempt fails,
 the task is `failed` unless `retries` still covers the new count.

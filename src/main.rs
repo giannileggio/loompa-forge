@@ -90,7 +90,9 @@ enum Command {
     },
     /// Remove the worktrees of finished tasks (done only, unless --all).
     ///
-    /// Worktrees with uncommitted changes are kept. Branches are never deleted.
+    /// Worktrees with uncommitted changes are kept. Branches are never
+    /// deleted. With --archive, also deletes the archived task file and its
+    /// logs, once its worktree is gone.
     Clean(clean::CleanArgs),
     /// Serve a read-only dashboard over the queue, until interrupted.
     Web(web::WebArgs),
