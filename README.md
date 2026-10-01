@@ -37,14 +37,15 @@ lf start
 
 That's all: the first command you run sets up `~/.loompa-forge` and picks the
 coding agent it finds on your `PATH`, and `lf add` works on the git repo you're
-standing in. In the dashboard, **+ New task** queues more work, **Start the
-runner** turns it on, and **Setup check** says what's missing, all without the
-terminal. Run `lf` on its own any time to see where things stand and what to
+standing in. In the dashboard, **+ New task** queues more work (once or on a
+schedule), **Start the runner** turns it on, and **Setup** helps you pick and
+install a coding agent and says what else is missing, all without the terminal.
+No agent installed yet? `lf agents` lists them with install commands. Run `lf` on its own any time to see where things stand and what to
 try next, and `lf doctor` if something isn't running.
 
 ## Status
 
-Working now: `init`, `add`, `ls`, `validate`, `start`, `stop`, `lf run` (the runner and
+Working now: `init`, `add`, `ls`, `validate`, `start`, `stop`, `agents`, `lf run` (the runner and
 scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`),
 `done|fail|cancel|retry|attach`, `logs`, `clean`, `web` (a dashboard you can
 also act from), `status`/`doctor`/`service` (keeping the runner healthy), and
@@ -82,6 +83,8 @@ echo "Update deps and run tests" | lf add --repo ~/Projects/myapp --agent codex
 
 lf start             # the runner and the dashboard together (--no-open: no browser)
 lf stop              # stop the runner (work already underway keeps going in tmux)
+lf agents            # which coding agents are installed, and how to install the rest
+lf agents use codex  # make one the default for new tasks
 
 lf ls                # queue
 lf ls --schedules    # schedules with their next run
@@ -157,8 +160,20 @@ project, when to start, what to do with the result), calling the same code as
 `lf add`; `lf start` is `lf web` plus a runner that stops with it. If the runner is off,
 a banner says so with a **Start the runner** button (that runner keeps going
 after you close the dashboard; `lf stop` or the **stop** link next to
-"runner: on" ends it), and **Setup check** shows what `lf doctor` finds (tmux,
-git, your agent, task files), with a banner when something needs attention.
+"runner: on" ends it), and **Setup** lists the coding agents (installed or not,
+with the install command to copy, and **Use this one** to make one the default)
+above what `lf doctor` finds (tmux, git, task files), with a banner when
+something needs attention. lf doesn't run the installs for you: they're global
+`npm install -g` commands and each agent needs you to sign in once.
+
+A task that is still *Waiting* has an **Edit** button: change what it does, the
+project, when it starts, or what happens when it's done (not once it has
+started: cancel it and add a new one). **+ New task** with "How often?" set to
+anything but "Just once" creates a schedule, which appears under *Repeating*
+with **Edit**, **Pause**/**Resume** and **Delete**. Changing a schedule's time or
+resuming it starts counting from now, so it never fires for a slot that passed
+meanwhile. The dashboard writes the same Markdown files you would, so
+fields it doesn't show (`branch`, `model`, `allow_overlap`...) are kept.
 The dashboard uses plainer words than the files do: *Waiting*, *Working*,
 *Finished*, *Repeating*, *Needs review* (`pending`, `running`, the archive,
 schedules, `needs_review`), and a failed task shows why it failed. Each task row offers the buttons that make sense for its

@@ -3,6 +3,7 @@ mod cmd;
 mod config;
 mod control;
 mod doctor;
+mod edit;
 mod frontmatter;
 mod fsutil;
 mod git;
@@ -101,6 +102,12 @@ enum Command {
     /// Run the queue and serve the dashboard together: the one-command way to
     /// get going. Opens the dashboard in your browser.
     Start(web::WebArgs),
+    /// Show which coding agents are installed, how to get the others, and
+    /// pick the default (`lf agents use <name>`).
+    Agents {
+        #[command(subcommand)]
+        action: Option<AgentsAction>,
+    },
     /// Stop the runner that `lf run` or `lf start` began. Tasks already
     /// running keep going; start the runner again to resume the queue.
     Stop,
@@ -120,6 +127,12 @@ enum Command {
         #[arg(long)]
         status_file: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum AgentsAction {
+    /// Make an agent the default for tasks that don't name one.
+    Use { name: String },
 }
 
 fn main() -> ExitCode {
@@ -152,6 +165,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             | Command::Web(_)
             | Command::Start(_)
             | Command::Status
+            | Command::Agents { .. }
     ) {
         cmd::ensure_ready(&home)?;
     }
@@ -176,6 +190,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Web(args) => web::serve(&home, args)?,
         Command::Start(args) => web::start(&home, args)?,
         Command::Status => doctor::status(&home)?,
+        Command::Agents { action } => match action {
+            None => cmd::agents(&home)?,
+            Some(AgentsAction::Use { name }) => cmd::use_agent(&home, &name)?,
+        },
         Command::Stop => match control::stop_runner(&home)? {
             Some(pid) => {
                 println!("Stopped the runner (pid {pid}). Tasks already running keep going.")

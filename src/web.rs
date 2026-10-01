@@ -4,7 +4,10 @@
 //! `/api/tasks/<id>/logs` endpoint, `/api/tasks/<id>/{done,fail,cancel,retry}`
 //! POST routes that call straight into the same code `lf done|fail|cancel|retry`
 //! use, `POST /api/tasks` to queue a new task (the "New task" form),
-//! `POST /api/runner/{start,stop}`, and `GET /api/doctor` for the setup check. Only binds to 127.0.0.1, but a web page you visit can still send
+//! `POST /api/tasks/<id>/edit` for a task that hasn't started, schedule
+//! create/edit/pause/resume/delete under `/api/schedules`, `POST
+//! /api/runner/{start,stop}`, and `GET /api/doctor` and `/api/agents` (plus
+//! `POST /api/agents/default`) for the setup views. Only binds to 127.0.0.1, but a web page you visit can still send
 //! requests there, so every request must carry a loopback `Host` (defeats DNS
 //! rebinding), and POSTs a per-run token that only the dashboard page itself
 //! can read (defeats cross-site forgery) and a loopback `Origin`, if any.
@@ -20,6 +23,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use crate::cmd::{NewTask, create_task, md_files};
 use crate::config::{Config, on_path};
 use crate::control;
+use crate::edit::{self, ScheduleEdit, Start, TaskEdit};
 use crate::home::{Home, contract_tilde};
 use crate::run::RunnerState;
 use crate::schedule::Schedule;
@@ -243,6 +247,12 @@ fn route(ctx: &Ctx, method: &Method, url: &str, body: &str) -> Reply {
                 Err(e) => json_reply(500, json_err(&e)),
             },
             ["api", "doctor"] => json_reply(200, doctor_json(home)),
+            ["api", "agents"] => match agents_json(home) {
+                Ok(json) => json_reply(200, json),
+                Err(e) => json_reply(500, json_err(&e)),
+            },
+            ["api", "tasks", id] => detail_reply(edit::task_detail(home, id)),
+            ["api", "schedules", id] => detail_reply(edit::schedule_detail(home, id)),
             ["api", "tasks", id, "logs"] => {
                 let attempt = query_param(url, "attempt").and_then(|v| v.parse().ok());
                 match control::logs(home, id, attempt) {
@@ -267,6 +277,22 @@ fn route(ctx: &Ctx, method: &Method, url: &str, body: &str) -> Reply {
                 ),
                 Err(e) => json_reply(400, json_err(&e)),
             },
+            ["api", "tasks", id, "edit"] => mutation_reply(perform_edit_task(home, id, body)),
+            ["api", "schedules"] => match perform_create_schedule(home, body) {
+                Ok(id) => json_reply(200, serde_json::json!({ "ok": true, "id": id }).to_string()),
+                Err(e) => json_reply(400, json_err(&e)),
+            },
+            ["api", "schedules", id, "edit"] => {
+                mutation_reply(perform_edit_schedule(home, id, body))
+            }
+            ["api", "schedules", id, "pause"] => {
+                mutation_reply(edit::set_schedule_enabled(home, id, false))
+            }
+            ["api", "schedules", id, "resume"] => {
+                mutation_reply(edit::set_schedule_enabled(home, id, true))
+            }
+            ["api", "schedules", id, "delete"] => mutation_reply(edit::delete_schedule(home, id)),
+            ["api", "agents", "default"] => mutation_reply(perform_set_default_agent(home, body)),
             ["api", "tasks"] => match perform_create(home, body) {
                 Ok(id) => json_reply(200, serde_json::json!({ "ok": true, "id": id }).to_string()),
                 Err(e) => json_reply(400, json_err(&e)),
@@ -353,13 +379,10 @@ fn perform_create(home: &Home, body: &str) -> Result<String> {
     if repo.is_empty() {
         anyhow::bail!("choose the repository the agent should work in");
     }
-    let scheduled_at = match form.start.as_deref().map(str::trim) {
-        None | Some("") | Some("asap") => None,
-        Some(delay) => {
-            let delay = humantime::parse_duration(delay)
-                .map_err(|e| anyhow::anyhow!("can't start after `{delay}`: {e}"))?;
-            Some(now() + delay)
-        }
+    // A new task has nothing to "keep": no start time means as soon as possible.
+    let scheduled_at = match edit::parse_start(form.start.as_deref())? {
+        Start::At(at) => Some(at),
+        Start::Keep | Start::Asap => None,
     };
     let config = Config::load(&home.config_path())?;
     let spec = TaskSpec {
@@ -396,6 +419,99 @@ fn perform_create(home: &Home, body: &str) -> Result<String> {
             }
         }
     }
+}
+
+/// 200 with the object, or 404 with why there isn't one.
+fn detail_reply(detail: Result<serde_json::Value>) -> Reply {
+    match detail {
+        Ok(v) => json_reply(200, v.to_string()),
+        Err(e) => json_reply(404, json_err(&e)),
+    }
+}
+
+/// `{"ok":true}`, or 400 with what went wrong.
+fn mutation_reply(result: Result<()>) -> Reply {
+    match result {
+        Ok(()) => json_reply(200, "{\"ok\":true}".into()),
+        Err(e) => json_reply(400, json_err(&e)),
+    }
+}
+
+/// The edit form for a task that hasn't started.
+#[derive(Deserialize)]
+struct EditTaskBody {
+    prompt: String,
+    repo: String,
+    /// `keep` (or empty), `asap`, or a delay like `1h`.
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    on_finish: Option<OnFinish>,
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+fn perform_edit_task(home: &Home, id: &str, body: &str) -> Result<()> {
+    let form: EditTaskBody = serde_json::from_str(body).context("couldn't read the form")?;
+    edit::edit_task(
+        home,
+        id,
+        TaskEdit {
+            prompt: form.prompt,
+            repo: form.repo,
+            start: edit::parse_start(form.start.as_deref())?,
+            on_finish: form.on_finish,
+            agent: form.agent,
+        },
+    )
+}
+
+/// The schedule form, for creating and editing alike.
+#[derive(Deserialize)]
+struct ScheduleBody {
+    prompt: String,
+    repo: String,
+    cron: String,
+    #[serde(default)]
+    on_finish: Option<OnFinish>,
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+fn schedule_form(body: &str) -> Result<ScheduleEdit> {
+    let form: ScheduleBody = serde_json::from_str(body).context("couldn't read the form")?;
+    Ok(ScheduleEdit {
+        prompt: form.prompt,
+        repo: form.repo,
+        cron: form.cron,
+        on_finish: form.on_finish,
+        agent: form.agent,
+    })
+}
+
+fn perform_create_schedule(home: &Home, body: &str) -> Result<String> {
+    edit::create_schedule(home, schedule_form(body)?)
+}
+
+fn perform_edit_schedule(home: &Home, id: &str, body: &str) -> Result<()> {
+    edit::edit_schedule(home, id, schedule_form(body)?)
+}
+
+#[derive(Deserialize)]
+struct DefaultAgentBody {
+    agent: String,
+}
+
+fn perform_set_default_agent(home: &Home, body: &str) -> Result<()> {
+    let form: DefaultAgentBody = serde_json::from_str(body).context("couldn't read the form")?;
+    home.ensure_initialized()?;
+    crate::config::set_default_agent(&home.config_path(), &form.agent)
+}
+
+/// Which coding agents are installed here and how to get the others.
+fn agents_json(home: &Home) -> Result<String> {
+    let config = Config::load(&home.config_path())?;
+    Ok(serde_json::json!({ "agents": crate::config::agent_statuses(&config) }).to_string())
 }
 
 /// The setup check: what `lf doctor` looks at, for the dashboard.
@@ -442,6 +558,8 @@ struct Row {
 #[derive(Serialize)]
 struct ScheduleRow {
     id: String,
+    /// The first line of what it asks the agent to do.
+    summary: String,
     enabled: bool,
     cron: String,
     next: String,
@@ -566,6 +684,7 @@ fn state_json(home: &Home, cwd_repo: Option<&str>) -> Result<String> {
                 };
                 ScheduleRow {
                     id: s.id.clone(),
+                    summary: s.prompt.lines().next().unwrap_or_default().to_string(),
                     enabled: s.enabled,
                     cron: s.cron.clone(),
                     next,
@@ -626,12 +745,7 @@ fn form_info(config: &Config, cwd_repo: Option<&str>, tasks: &[&Vec<Task>]) -> F
         repos,
         agents,
         agent: config.defaults.agent.clone(),
-        on_finish: match config.defaults.on_finish {
-            OnFinish::None => "none",
-            OnFinish::Commit => "commit",
-            OnFinish::Push => "push",
-            OnFinish::Pr => "pr",
-        },
+        on_finish: edit::on_finish_str(config.defaults.on_finish),
     }
 }
 

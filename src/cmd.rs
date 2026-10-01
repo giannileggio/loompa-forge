@@ -83,6 +83,62 @@ pub fn ensure_ready(home: &Home) -> Result<()> {
     Ok(())
 }
 
+/// `lf agents`: which agents are installed, and how to get the others.
+pub fn agents(home: &Home) -> Result<()> {
+    let config = Config::load(&home.config_path())?;
+    let statuses = crate::config::agent_statuses(&config);
+    let mut rows = vec![row(["AGENT", "STATUS", "HOW TO INSTALL"])];
+    for a in &statuses {
+        let status = match (a.installed, a.is_default) {
+            (true, true) => "installed (default)",
+            (true, false) => "installed",
+            (false, true) => "not installed (default)",
+            (false, false) => "not installed",
+        };
+        rows.push(vec![
+            a.name.clone(),
+            status.into(),
+            if a.installed {
+                String::new()
+            } else {
+                a.install.unwrap_or("see its documentation").into()
+            },
+        ]);
+    }
+    print_table(&rows);
+    println!();
+    if statuses.iter().any(|a| a.installed) {
+        println!("Pick the default for new tasks with: lf agents use <name>");
+    } else {
+        println!(
+            "Install one with the command shown (it needs Node.js), run it once in a terminal \
+             to sign in, then pick it with: lf agents use <name>"
+        );
+    }
+    Ok(())
+}
+
+/// `lf agents use <name>`: sets `agent` under `[defaults]` in config.toml.
+pub fn use_agent(home: &Home, name: &str) -> Result<()> {
+    let config = Config::load(&home.config_path())?;
+    crate::config::set_default_agent(&home.config_path(), name)?;
+    println!("`{name}` is now the default agent.");
+    if let Some(a) = crate::config::agent_statuses(&config)
+        .iter()
+        .find(|a| a.name == name)
+        && !a.installed
+    {
+        println!(
+            "Note: `{}` isn't installed yet; tasks will fail until it is.{}",
+            a.program,
+            a.install
+                .map(|cmd| format!(" Install it with: {cmd}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 /// What a bare `lf` shows: where things stand and the next thing to try.
 pub fn welcome(home: &Home) -> Result<()> {
     println!("loompa-forge: queue coding-agent tasks and let them run while you're away.\n");
@@ -115,7 +171,10 @@ fn choose_agent(given: Option<String>) -> Result<Option<String>> {
     let found = installed_presets();
     match found.as_slice() {
         [] => {
-            println!("no preset agent found on $PATH; set `agent` under [defaults] in config.toml");
+            println!(
+                "No coding agent found yet. `lf agents` shows how to install one; \
+                 then `lf agents use <name>` makes it the default."
+            );
             Ok(None)
         }
         [one] => {
@@ -527,7 +586,7 @@ pub fn md_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn fmt_time(t: DateTime<FixedOffset>) -> String {
+pub fn fmt_time(t: DateTime<FixedOffset>) -> String {
     t.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string()
 }
 
