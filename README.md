@@ -37,13 +37,14 @@ lf start
 
 That's all: the first command you run sets up `~/.loompa-forge` and picks the
 coding agent it finds on your `PATH`, and `lf add` works on the git repo you're
-standing in. In the dashboard, **+ New task** queues more work without the
+standing in. In the dashboard, **+ New task** queues more work, **Start the
+runner** turns it on, and **Setup check** says what's missing, all without the
 terminal. Run `lf` on its own any time to see where things stand and what to
 try next, and `lf doctor` if something isn't running.
 
 ## Status
 
-Working now: `init`, `add`, `ls`, `validate`, `start`, `lf run` (the runner and
+Working now: `init`, `add`, `ls`, `validate`, `start`, `stop`, `lf run` (the runner and
 scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`),
 `done|fail|cancel|retry|attach`, `logs`, `clean`, `web` (a dashboard you can
 also act from), `status`/`doctor`/`service` (keeping the runner healthy), and
@@ -80,6 +81,7 @@ lf add --repo ~/Projects/myapp --on-finish pr --in 2h \
 echo "Update deps and run tests" | lf add --repo ~/Projects/myapp --agent codex
 
 lf start             # the runner and the dashboard together (--no-open: no browser)
+lf stop              # stop the runner (work already underway keeps going in tmux)
 
 lf ls                # queue
 lf ls --schedules    # schedules with their next run
@@ -152,7 +154,14 @@ What `lf` does so that a bad day doesn't lose work:
 refreshed every couple of seconds) — a Sidekiq-style view of the same state
 `lf ls` prints. **+ New task** queues work from a form (what to do, which
 project, when to start, what to do with the result), calling the same code as
-`lf add`; `lf start` is `lf web` plus a runner that stops with it. Each task row offers the buttons that make sense for its
+`lf add`; `lf start` is `lf web` plus a runner that stops with it. If the runner is off,
+a banner says so with a **Start the runner** button (that runner keeps going
+after you close the dashboard; `lf stop` or the **stop** link next to
+"runner: on" ends it), and **Setup check** shows what `lf doctor` finds (tmux,
+git, your agent, task files), with a banner when something needs attention.
+The dashboard uses plainer words than the files do: *Waiting*, *Working*,
+*Finished*, *Repeating*, *Needs review* (`pending`, `running`, the archive,
+schedules, `needs_review`), and a failed task shows why it failed. Each task row offers the buttons that make sense for its
 status (done, fail, cancel, retry) plus a log viewer, calling the same code
 as `lf done|fail|cancel|retry` and `lf logs`. It only binds to
 `127.0.0.1`, so anyone who can reach it could already run `lf` locally

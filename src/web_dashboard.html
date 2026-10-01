@@ -182,6 +182,25 @@
   @media (max-width: 560px) { form.new-task .row { grid-template-columns: 1fr; } }
   form.new-task .buttons { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
   form.new-task .error { color: var(--failed); font-size: 12px; margin-right: auto; white-space: pre-line; }
+  .why { color: var(--muted); font-size: 11px; max-width: 280px; white-space: normal; margin-top: 2px; }
+  header .ghost, .notice .btn { font-size: 12px; }
+  header .ghost {
+    background: none; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; cursor: pointer;
+  }
+  header .ghost:hover { background: rgba(127,127,127,.12); }
+  .linkish { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0 0 0 6px; font-size: inherit; text-decoration: underline; }
+  .notice .btn { margin-left: 8px; padding: 4px 10px; }
+  .notice.bad { border-color: var(--failed); background: rgba(220,38,38,.08); }
+  ul.checks { list-style: none; margin: 0; padding: 12px 16px; overflow: auto; }
+  ul.checks li { display: flex; gap: 10px; padding: 6px 0; font-size: 13px; border-bottom: 1px solid var(--border); }
+  ul.checks li:last-child { border-bottom: none; }
+  ul.checks .ico { font-weight: 700; width: 16px; flex: none; text-align: center; }
+  ul.checks .c-ok .ico { color: var(--done); }
+  ul.checks .c-warn .ico { color: var(--review); }
+  ul.checks .c-fail .ico { color: var(--failed); }
+  .modal .foot { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+  .modal .foot .btn { margin-left: auto; }
   .warn { margin: 8px 16px; padding: 8px 12px; border: 1px solid var(--failed); border-radius: 6px; font-size: 13px; }
   .warn[hidden] { display: none; }
 </style>
@@ -192,23 +211,25 @@
   <span class="home mono" id="home"></span>
   <span class="updated" id="runner"></span>
   <span class="updated"><span class="dot"></span>as of <span id="updated">-</span></span>
+  <button class="ghost" id="setup-open" title="Check that tmux, git and your agent are set up">Setup check</button>
   <button class="primary" id="new-task-open">+ New task</button>
 </header>
 
 <div class="notice" id="runner-notice" hidden>
-  <strong>Nothing will start yet: the runner isn't running.</strong>
-  Stop this and run <code>lf start</code> instead of <code>lf web</code>, or run
-  <code>lf run</code> in another terminal. Tasks you add now wait in the queue.
+  <strong>Nothing will start yet: the runner is off.</strong>
+  The runner is what picks up waiting tasks and hands them to an agent. Tasks you add now just wait.
+  <button class="btn" data-action="runner-start" id="runner-start">Start the runner</button>
 </div>
+<div class="notice bad" id="setup-notice" hidden></div>
 
 <div class="stats" id="stats"></div>
 <div class="warn" id="invalid" hidden></div>
 
 <nav id="tabs">
-  <button data-tab="queue" class="active">Queue <span class="count" id="c-queue">0</span></button>
-  <button data-tab="running">Busy <span class="count" id="c-running">0</span></button>
-  <button data-tab="archive">Archive <span class="count" id="c-archive">0</span></button>
-  <button data-tab="schedules">Schedules <span class="count" id="c-schedules">0</span></button>
+  <button data-tab="queue" class="active" title="Tasks waiting for their turn">Waiting <span class="count" id="c-queue">0</span></button>
+  <button data-tab="running" title="Tasks an agent is working on right now">Working <span class="count" id="c-running">0</span></button>
+  <button data-tab="archive" title="Tasks that are done, failed or cancelled">Finished <span class="count" id="c-archive">0</span></button>
+  <button data-tab="schedules" title="Tasks that are queued again on a schedule">Repeating <span class="count" id="c-schedules">0</span></button>
 </nav>
 
 <main>
@@ -274,15 +295,43 @@
     </form>
   </div>
 </div>
+
+<div class="overlay" id="setup-overlay">
+  <div class="modal">
+    <header>
+      <h2>Setup check</h2>
+      <button id="setup-close" aria-label="Close">&times;</button>
+    </header>
+    <ul class="checks" id="setup-list"><li>checking&hellip;</li></ul>
+    <div class="foot">
+      <span>&#10007; stops tasks from running; &#9888; is worth a look.</span>
+      <button class="btn secondary" id="setup-again">Check again</button>
+    </div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 
 <script>
 const TOKEN = document.querySelector('meta[name="lf-token"]').content;
 const STAT_LABELS = [
-  ["pending", "Pending"], ["running", "Running"], ["done", "Done"],
-  ["failed", "Failed"], ["cancelled", "Cancelled"], ["needs_review", "Review"],
-  ["schedules", "Schedules"],
+  ["pending", "Waiting"], ["running", "Working"], ["done", "Done"],
+  ["failed", "Failed"], ["cancelled", "Cancelled"], ["needs_review", "Needs review"],
+  ["schedules", "Repeating"],
 ];
+
+// The words the page uses for the statuses in the task files and `lf ls`.
+const STATUS_LABELS = {
+  pending: "Waiting", running: "Working", done: "Done", failed: "Failed",
+  cancelled: "Cancelled", needs_review: "Needs review",
+};
+const STATUS_HELP = {
+  pending: "Queued: it starts when the runner picks it up (or at its start time).",
+  running: "An agent is working on it right now.",
+  done: "Finished successfully.",
+  failed: "It didn't work out. The reason is shown; you can try again.",
+  cancelled: "Stopped before it finished.",
+  needs_review: "The interactive session ended without being marked done or failed. Look at the result, then mark it done or try again.",
+};
 
 // Task fields (branch names, repo paths, cron strings, ids, ...) come from
 // task/schedule files the user or an agent wrote, not from lf itself, so
@@ -294,7 +343,8 @@ function escapeHtml(s) {
 }
 
 function badge(status) {
-  return `<span class="badge ${escapeHtml(status)}">${escapeHtml(status.replace("_", " "))}</span>`;
+  const label = STATUS_LABELS[status] || status.replace("_", " ");
+  return `<span class="badge ${escapeHtml(status)}" title="${escapeHtml(STATUS_HELP[status] || "")}">${escapeHtml(label)}</span>`;
 }
 
 function taskTable(rows, cols, empty) {
@@ -314,7 +364,14 @@ const ACTIONS_FOR_STATUS = {
   done: [],
 };
 
-const ACTION_LABELS = { done: "Done", fail: "Fail", cancel: "Cancel", retry: "Retry", logs: "Logs" };
+const ACTION_LABELS = { done: "Mark done", fail: "Give up", cancel: "Cancel", retry: "Try again", logs: "Output" };
+const ACTION_HELP = {
+  done: "Finish it: runs the when-done step and moves it to Finished.",
+  fail: "Stop for good, without retrying.",
+  cancel: "Drop it. The when-done step doesn't run.",
+  retry: "Put it back in the queue, in the same workspace.",
+  logs: "See what the agent printed.",
+};
 const DANGER_ACTIONS = new Set(["fail", "cancel"]);
 const CONFIRM_ACTIONS = new Set(["fail", "cancel"]);
 
@@ -322,15 +379,16 @@ function actionButtons(r) {
   const acts = [...(ACTIONS_FOR_STATUS[r.status] || [])];
   acts.push("logs"); // always offered; the endpoint reports if there's nothing yet
   return acts.map(a =>
-    `<button data-id="${escapeHtml(r.id)}" data-action="${a}" class="${DANGER_ACTIONS.has(a) ? "danger" : ""}">${ACTION_LABELS[a]}</button>`
+    `<button data-id="${escapeHtml(r.id)}" data-action="${a}" title="${escapeHtml(ACTION_HELP[a])}" class="${DANGER_ACTIONS.has(a) ? "danger" : ""}">${ACTION_LABELS[a]}</button>`
   ).join("");
 }
 
 const TASK_COLS = [
   { key: "id", label: "ID", mono: true },
-  { key: "status", label: "Status", render: r => badge(r.status) },
+  { key: "status", label: "Status", render: r => badge(r.status) +
+      (r.error && r.status !== "done" ? `<div class="why">${escapeHtml(r.error)}</div>` : "") },
   { key: "when", label: "When" },
-  { key: "repo", label: "Repo", mono: true },
+  { key: "repo", label: "Project", mono: true },
   { key: "branch", label: "Branch", mono: true },
   { key: "agent", label: "Agent" },
   { key: "tokens", label: "Tokens", mono: true },
@@ -341,9 +399,9 @@ const TASK_COLS = [
 const SCHEDULE_COLS = [
   { key: "id", label: "ID", mono: true },
   { key: "enabled", label: "Enabled", render: r => r.enabled ? "yes" : "no" },
-  { key: "cron", label: "Cron", mono: true },
+  { key: "cron", label: "Schedule (cron)", mono: true },
   { key: "next", label: "Next run" },
-  { key: "repo", label: "Repo", mono: true },
+  { key: "repo", label: "Project", mono: true },
 ];
 
 async function refresh() {
@@ -359,9 +417,10 @@ async function refresh() {
   document.getElementById("updated").textContent = state.generated_at;
 
   const runner = document.getElementById("runner");
-  runner.textContent = state.runner.alive
-    ? `runner: running${state.runner.last_tick ? ` (last pass ${state.runner.last_tick})` : ""}`
-    : "runner: not running";
+  runner.innerHTML = state.runner.alive
+    ? `runner: on${state.runner.last_tick ? ` (last pass ${escapeHtml(state.runner.last_tick)})` : ""}` +
+      `<button class="linkish" data-action="runner-stop" title="Stop picking up new tasks. Work already underway keeps going.">stop</button>`
+    : "runner: off";
   document.getElementById("runner-notice").hidden = state.runner.alive;
   formInfo = state.form;
 
@@ -384,11 +443,13 @@ async function refresh() {
     ? `<div class="empty"><div class="big">No tasks yet</div>
          Describe some work and an agent will do it while you're away.<br>
          <button class="btn" data-action="new">+ New task</button></div>`
-    : `<div class="empty">The queue is empty.</div>`);
+    : `<div class="empty">Nothing is waiting.</div>`);
   document.getElementById("panel-running").innerHTML = taskTable(state.running, TASK_COLS,
-    `<div class="empty">Nothing running right now.</div>`);
-  document.getElementById("panel-archive").innerHTML = taskTable(state.archive, TASK_COLS);
-  document.getElementById("panel-schedules").innerHTML = taskTable(state.schedules, SCHEDULE_COLS);
+    `<div class="empty">Nothing is being worked on right now.</div>`);
+  document.getElementById("panel-archive").innerHTML = taskTable(state.archive, TASK_COLS,
+    `<div class="empty">Nothing has finished yet.</div>`);
+  document.getElementById("panel-schedules").innerHTML = taskTable(state.schedules, SCHEDULE_COLS,
+    `<div class="empty">No repeating tasks yet. A schedule is a Markdown file in <code>${escapeHtml(state.home)}/schedules</code>; see the README.</div>`);
 }
 
 document.getElementById("tabs").addEventListener("click", (e) => {
@@ -431,11 +492,12 @@ logsOverlay.addEventListener("click", (e) => { if (e.target === logsOverlay) log
 async function runAction(id, action) {
   let body;
   if (action === "fail") {
-    const reason = prompt(`Reason for failing ${id} (optional):`, "");
+    const reason = prompt(`Why are you giving up on ${id}? (optional)`, "");
     if (reason === null) return; // cancelled
     body = JSON.stringify({ reason });
   }
-  if (CONFIRM_ACTIONS.has(action) && !confirm(`${ACTION_LABELS[action]} ${id}?`)) return;
+  const confirmText = { fail: `Give up on ${id}? It won't be retried.`, cancel: `Cancel ${id}?` };
+  if (CONFIRM_ACTIONS.has(action) && action !== "fail" && !confirm(confirmText[action])) return;
 
   try {
     const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/${action}`, {
@@ -457,14 +519,79 @@ document.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-action]");
   if (!btn) return;
   const { id, action } = btn.dataset;
-  if (action === "new") {
+  if (action === "setup") {
+    openSetup();
+  } else if (action === "new") {
     openNewTask();
+  } else if (action === "runner-start" || action === "runner-stop") {
+    runnerAction(action === "runner-start" ? "start" : "stop", btn);
   } else if (action === "logs") {
     showLogs(id);
   } else {
     runAction(id, action);
   }
 });
+
+// ---- Runner on/off
+
+async function runnerAction(what, btn) {
+  if (what === "stop" && !confirm("Stop the runner? Work already underway keeps going, but nothing new starts until you turn it back on.")) return;
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/runner/${what}`, { method: "POST", headers: { "X-LF-Token": TOKEN } });
+    const data = await res.json();
+    if (!res.ok) toast(data.error || `couldn't ${what} the runner`);
+    else toast(what === "start" ? "Runner started" : "Runner stopped", true);
+  } catch (e) {
+    toast(String(e));
+  }
+  btn.disabled = false;
+  refresh();
+}
+
+// ---- Setup check
+
+const setupOverlay = document.getElementById("setup-overlay");
+const setupList = document.getElementById("setup-list");
+const ICONS = { ok: "\u2713", warn: "\u26A0", fail: "\u2717" };
+
+async function loadSetup() {
+  const res = await fetch("/api/doctor");
+  return (await res.json()).checks;
+}
+
+function renderSetup(checks) {
+  setupList.innerHTML = checks.map(c =>
+    `<li class="c-${c.level}"><span class="ico">${ICONS[c.level]}</span><span>${escapeHtml(c.message)}</span></li>`
+  ).join("");
+}
+
+// A banner only when something needs attention; the full list is one click away.
+async function checkSetupQuietly() {
+  const notice = document.getElementById("setup-notice");
+  try {
+    const checks = await loadSetup();
+    const problems = checks.filter(c => c.level !== "ok");
+    if (problems.length === 0) { notice.hidden = true; return; }
+    const worst = problems.find(c => c.level === "fail") || problems[0];
+    notice.hidden = false;
+    notice.classList.toggle("bad", problems.some(c => c.level === "fail"));
+    notice.innerHTML = `<strong>${problems.length === 1 ? "One thing needs attention" : problems.length + " things need attention"}:</strong> ` +
+      `${escapeHtml(worst.message)}<button class="linkish" data-action="setup">See all checks</button>`;
+  } catch (e) { /* the page still works without it */ }
+}
+
+async function openSetup() {
+  setupList.innerHTML = "<li>checking&hellip;</li>";
+  setupOverlay.classList.add("active");
+  try { renderSetup(await loadSetup()); }
+  catch (e) { setupList.innerHTML = `<li class="c-fail"><span class="ico">${ICONS.fail}</span><span>${escapeHtml(String(e))}</span></li>`; }
+}
+
+document.getElementById("setup-open").addEventListener("click", openSetup);
+document.getElementById("setup-again").addEventListener("click", async () => { await openSetup(); checkSetupQuietly(); });
+document.getElementById("setup-close").addEventListener("click", () => setupOverlay.classList.remove("active"));
+setupOverlay.addEventListener("click", (e) => { if (e.target === setupOverlay) setupOverlay.classList.remove("active"); });
 
 // ---- New task form
 
@@ -500,7 +627,11 @@ document.getElementById("new-close").addEventListener("click", closeNewTask);
 document.getElementById("new-cancel").addEventListener("click", closeNewTask);
 newOverlay.addEventListener("click", (e) => { if (e.target === newOverlay) closeNewTask(); });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { closeNewTask(); logsOverlay.classList.remove("active"); }
+  if (e.key === "Escape") {
+    closeNewTask();
+    logsOverlay.classList.remove("active");
+    setupOverlay.classList.remove("active");
+  }
 });
 // Cmd/Ctrl+Enter submits from the prompt box.
 document.getElementById("f-prompt").addEventListener("keydown", (e) => {
@@ -541,6 +672,7 @@ newForm.addEventListener("submit", async (e) => {
 });
 
 refresh();
+checkSetupQuietly();
 setInterval(refresh, 2000);
 </script>
 </body>

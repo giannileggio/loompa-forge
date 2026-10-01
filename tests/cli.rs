@@ -735,3 +735,91 @@ fn start_runs_the_runner_and_the_dashboard_together() {
     child.wait().unwrap();
     Command::new("kill").arg(runner_pid).status().unwrap();
 }
+
+/// Waits until `lf status` reports the runner as `up` (or not), up to five
+/// seconds.
+fn wait_for_runner(home: &Path, up: bool) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let status = stdout(&ok(run(lf(home).arg("status"))));
+        if status.contains("running (pid") == up || std::time::Instant::now() > deadline {
+            return status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn stop_stops_a_runner_and_is_calm_when_there_is_none() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    let out = stdout(&ok(run(lf(home.path()).arg("stop"))));
+    assert!(out.contains("isn't running"), "{out}");
+
+    // A runner as `lf run` would leave it, in the background.
+    let mut runner = lf(home.path())
+        .arg("run")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_for_runner(home.path(), true).contains("running (pid"));
+
+    let out = stdout(&ok(run(lf(home.path()).arg("stop"))));
+    assert!(out.contains("Stopped the runner"), "{out}");
+    runner.wait().unwrap(); // it really exited
+    assert!(wait_for_runner(home.path(), false).contains("NOT running"));
+
+    let out = stdout(&ok(run(lf(home.path()).arg("stop"))));
+    assert!(out.contains("isn't running"), "{out}");
+}
+
+#[test]
+fn web_can_start_and_stop_the_runner_and_run_the_setup_check() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    let port = 18343u16;
+    let mut child = lf(home.path())
+        .args(["web", "--no-open", "--port", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let token = page_token(port);
+    assert!(http_get(port, "/api/state").contains("\"alive\":false"));
+
+    let started = http_post(port, &token, "/api/runner/start", "");
+    assert!(started.starts_with("HTTP/1.1 200"), "{started}");
+    assert!(started.contains("\"started\":true"), "{started}");
+    assert!(http_get(port, "/api/state").contains("\"alive\":true"));
+    // Pressing it again is harmless.
+    let again = http_post(port, &token, "/api/runner/start", "");
+    assert!(again.contains("\"started\":false"), "{again}");
+
+    let stopped = http_post(port, &token, "/api/runner/stop", "");
+    assert!(stopped.starts_with("HTTP/1.1 200"), "{stopped}");
+    assert!(http_get(port, "/api/state").contains("\"alive\":false"));
+
+    // Same token rule as every other POST.
+    let no_token = http(
+        port,
+        "POST",
+        "/api/runner/start",
+        &format!("127.0.0.1:{port}"),
+        &[],
+        "",
+    );
+    assert!(no_token.starts_with("HTTP/1.1 403"), "{no_token}");
+
+    let doctor = http_get(port, "/api/doctor");
+    assert!(doctor.starts_with("HTTP/1.1 200"), "{doctor}");
+    assert!(doctor.contains("config.toml is valid"), "{doctor}");
+    assert!(doctor.contains("\"level\":\"ok\""), "{doctor}");
+    // Whether a runner is up is the dashboard's own banner, not a check.
+    assert!(!doctor.contains("runner"), "{doctor}");
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}

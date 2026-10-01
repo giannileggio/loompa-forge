@@ -101,6 +101,9 @@ enum Command {
     /// Run the queue and serve the dashboard together: the one-command way to
     /// get going. Opens the dashboard in your browser.
     Start(web::WebArgs),
+    /// Stop the runner that `lf run` or `lf start` began. Tasks already
+    /// running keep going; start the runner again to resume the queue.
+    Stop,
     /// Show whether the runner is alive, the queue, budget and failing schedules.
     Status,
     /// Check that tasks can run here: tools, config, agents, task files.
@@ -173,6 +176,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Web(args) => web::serve(&home, args)?,
         Command::Start(args) => web::start(&home, args)?,
         Command::Status => doctor::status(&home)?,
+        Command::Stop => match control::stop_runner(&home)? {
+            Some(pid) => {
+                println!("Stopped the runner (pid {pid}). Tasks already running keep going.")
+            }
+            None => println!("The runner isn't running."),
+        },
         Command::Doctor => return doctor::doctor(&home),
         Command::Service { manager } => doctor::service(&home, manager)?,
         Command::Exec { id, status_file } => return run::exec(&home, &id, &status_file),

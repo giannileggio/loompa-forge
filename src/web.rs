@@ -3,7 +3,8 @@
 //! Serves one HTML shell, a `/api/state` JSON endpoint the page polls, a
 //! `/api/tasks/<id>/logs` endpoint, `/api/tasks/<id>/{done,fail,cancel,retry}`
 //! POST routes that call straight into the same code `lf done|fail|cancel|retry`
-//! use, and `POST /api/tasks` to queue a new task (the "New task" form). Only binds to 127.0.0.1, but a web page you visit can still send
+//! use, `POST /api/tasks` to queue a new task (the "New task" form),
+//! `POST /api/runner/{start,stop}`, and `GET /api/doctor` for the setup check. Only binds to 127.0.0.1, but a web page you visit can still send
 //! requests there, so every request must carry a loopback `Host` (defeats DNS
 //! rebinding), and POSTs a per-run token that only the dashboard page itself
 //! can read (defeats cross-site forgery) and a loopback `Origin`, if any.
@@ -241,6 +242,7 @@ fn route(ctx: &Ctx, method: &Method, url: &str, body: &str) -> Reply {
                 Ok(json) => json_reply(200, json),
                 Err(e) => json_reply(500, json_err(&e)),
             },
+            ["api", "doctor"] => json_reply(200, doctor_json(home)),
             ["api", "tasks", id, "logs"] => {
                 let attempt = query_param(url, "attempt").and_then(|v| v.parse().ok());
                 match control::logs(home, id, attempt) {
@@ -251,6 +253,20 @@ fn route(ctx: &Ctx, method: &Method, url: &str, body: &str) -> Reply {
             _ => reply(404, "text/plain", "not found"),
         },
         Method::Post => match segments.as_slice() {
+            ["api", "runner", "start"] => match control::start_runner(home) {
+                Ok(started) => json_reply(
+                    200,
+                    serde_json::json!({ "ok": true, "started": started }).to_string(),
+                ),
+                Err(e) => json_reply(400, json_err(&e)),
+            },
+            ["api", "runner", "stop"] => match control::stop_runner(home) {
+                Ok(pid) => json_reply(
+                    200,
+                    serde_json::json!({ "ok": true, "pid": pid }).to_string(),
+                ),
+                Err(e) => json_reply(400, json_err(&e)),
+            },
             ["api", "tasks"] => match perform_create(home, body) {
                 Ok(id) => json_reply(200, serde_json::json!({ "ok": true, "id": id }).to_string()),
                 Err(e) => json_reply(400, json_err(&e)),
@@ -382,6 +398,15 @@ fn perform_create(home: &Home, body: &str) -> Result<String> {
     }
 }
 
+/// The setup check: what `lf doctor` looks at, for the dashboard.
+fn doctor_json(home: &Home) -> String {
+    let checks: Vec<_> = crate::doctor::checks(home)
+        .iter()
+        .map(|c| serde_json::json!({ "level": c.level(), "message": c.message() }))
+        .collect();
+    serde_json::json!({ "checks": checks }).to_string()
+}
+
 fn json_err(e: &anyhow::Error) -> String {
     serde_json::to_string(&serde_json::json!({ "error": format!("{e:#}") }))
         .unwrap_or_else(|_| "{\"error\":\"internal error\"}".to_string())
@@ -410,6 +435,8 @@ struct Row {
     agent: String,
     tokens: String,
     cost: String,
+    /// Why a failed (or otherwise unfinished) task ended up that way.
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -627,6 +654,7 @@ fn to_row(t: &Task, config: &Config) -> Row {
         },
         tokens: fmt_tokens(t.tokens_in, t.tokens_out),
         cost: fmt_cost(t.cost_usd),
+        error: t.error.clone().filter(|e| !e.trim().is_empty()),
     }
 }
 
@@ -658,6 +686,32 @@ mod tests {
         assert!(!is_loopback_origin("https://localhost:7433"));
         assert!(!is_loopback_origin("http://evil.com"));
         assert!(!is_loopback_origin("null"));
+    }
+
+    #[test]
+    fn a_failed_tasks_reason_reaches_its_row() {
+        let spec = TaskSpec {
+            repo: "/tmp".into(),
+            branch: None,
+            worktree: None,
+            agent: Some("claude".into()),
+            model: None,
+            mode: None,
+            on_finish: None,
+            retries: None,
+            retry_delay: None,
+            timeout: None,
+        };
+        let mut task = Task::new("t".into(), spec, "do it".into());
+        let config = Config::default();
+        assert_eq!(to_row(&task, &config).error, None);
+
+        task.status = Status::Failed;
+        task.error = Some("exit code 1".into());
+        assert_eq!(to_row(&task, &config).error.as_deref(), Some("exit code 1"));
+
+        task.error = Some("  ".into());
+        assert_eq!(to_row(&task, &config).error, None);
     }
 
     #[test]
