@@ -30,25 +30,71 @@ pub struct InitArgs {
 }
 
 pub fn init(home: &Home, args: InitArgs) -> Result<()> {
-    for dir in home.dirs() {
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    let config = home.config_path();
-    if config.exists() {
-        println!("kept existing {}", config.display());
-    } else {
-        let agent = choose_agent(args.agent)?;
-        crate::fsutil::write_atomic(&config, default_config_toml(agent.as_deref()))?;
-        println!("wrote {}", config.display());
-    }
-    skill::install_in_home(home)?;
     let global = match (args.global_skill, args.no_global_skill) {
         (true, _) => Some(true),
         (_, true) => Some(false),
         _ => None,
     };
-    skill::set_global(home, global)?;
+    setup(home, args.agent, Some(global))?;
     println!("initialized {}", home.root().display());
+    Ok(())
+}
+
+/// Creates the data folder, config and agent files. `global_skill` is what
+/// to do about the global skill links: `None` leaves them alone, `Some(c)`
+/// applies `skill::set_global` with choice `c`.
+fn setup(home: &Home, agent: Option<String>, global_skill: Option<Option<bool>>) -> Result<()> {
+    for dir in home.dirs() {
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let config = home.config_path();
+    if config.exists() {
+        skill::note(format_args!("kept existing {}", config.display()));
+    } else {
+        let agent = choose_agent(agent)?;
+        crate::fsutil::write_atomic(&config, default_config_toml(agent.as_deref()))?;
+        skill::note(format_args!("wrote {}", config.display()));
+    }
+    skill::install_in_home(home)?;
+    if let Some(choice) = global_skill {
+        skill::set_global(home, choice)?;
+    }
+    Ok(())
+}
+
+/// Sets the data folder up on first use, so nobody has to know about
+/// `lf init`. Asks nothing but which agent to default to when several are
+/// installed (and only on a terminal); the global-skill question is left to
+/// an explicit `lf init`.
+pub fn ensure_ready(home: &Home) -> Result<()> {
+    if home.ensure_initialized().is_ok() {
+        return Ok(());
+    }
+    // Guidance, not output: stdout stays clean for scripts reading `lf add`.
+    eprintln!(
+        "First run: setting up {} (this only happens once)",
+        contract_tilde(home.root())
+    );
+    skill::set_quiet(true);
+    let result = setup(home, None, None);
+    skill::set_quiet(false);
+    result?;
+    eprintln!("Tip: `lf init` can also let your coding agents queue tasks from any repo.\n");
+    Ok(())
+}
+
+/// What a bare `lf` shows: where things stand and the next thing to try.
+pub fn welcome(home: &Home) -> Result<()> {
+    println!("loompa-forge: queue coding-agent tasks and let them run while you're away.\n");
+    if home.ensure_initialized().is_ok() {
+        crate::doctor::status(home)?;
+        println!();
+    }
+    println!("Try:");
+    println!("  lf add \"Fix the login redirect\"   queue a task for the repo you're in");
+    println!("  lf start                           run the queue and open the dashboard");
+    println!("  lf ls                              see what's queued, running and done");
+    println!("  lf --help                          every command");
     Ok(())
 }
 
@@ -172,6 +218,9 @@ fn ls_once(home: &Home, archive: bool, schedules: bool) -> Result<()> {
         ]);
     }
     print_table(&rows);
+    if tasks.is_empty() && !archive && std::io::stdout().is_terminal() {
+        println!("\nNothing queued yet. Add something with: lf add \"describe the work\"");
+    }
     Ok(())
 }
 
@@ -204,13 +253,17 @@ fn ls_schedules(home: &Home, config: &Config) -> Result<()> {
 
 #[derive(clap::Args)]
 pub struct AddArgs {
-    /// Repository the task runs in.
+    /// What the agent should do. Asked for if omitted (or read from stdin
+    /// when piped).
+    #[arg(conflicts_with = "prompt")]
+    text: Option<String>,
+    /// Repository the task runs in [default: the git repo you're in].
     #[arg(long)]
-    repo: PathBuf,
+    repo: Option<PathBuf>,
     /// Task id (also the file name). Derived from the prompt if omitted.
     #[arg(long)]
     id: Option<String>,
-    /// The prompt. Read from stdin if omitted.
+    /// The prompt, as an option instead of the positional argument.
     #[arg(long, short)]
     prompt: Option<String>,
     #[arg(long)]
@@ -245,27 +298,24 @@ pub struct AddArgs {
     created_by: String,
 }
 
-pub fn add(home: &Home, args: AddArgs) -> Result<()> {
-    home.ensure_initialized()?;
-    let config = Config::load(&home.config_path())?;
+/// Everything needed to queue a task, from the CLI or the dashboard.
+pub struct NewTask {
+    pub prompt: String,
+    /// Derived from the prompt if `None`.
+    pub id: Option<String>,
+    pub spec: TaskSpec,
+    pub scheduled_at: Option<DateTime<FixedOffset>>,
+    pub created_by: String,
+}
 
-    let prompt = match args.prompt {
-        Some(p) => p,
-        None if std::io::stdin().is_terminal() => {
-            bail!("no prompt: pass --prompt or pipe it on stdin")
-        }
-        None => {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            buf
-        }
-    };
-    let prompt = prompt.trim().to_string();
+/// Validates `new` and writes its task file into the queue.
+pub fn create_task(home: &Home, config: &Config, new: NewTask) -> Result<(Task, PathBuf)> {
+    let prompt = new.prompt.trim().to_string();
     if prompt.is_empty() {
         bail!("the prompt is empty");
     }
 
-    let id = match args.id {
+    let id = match new.id {
         Some(id) => {
             validate_id(&id).map_err(anyhow::Error::msg)?;
             if id_taken(home, &id) {
@@ -279,9 +329,33 @@ pub fn add(home: &Home, args: AddArgs) -> Result<()> {
         ),
     };
 
-    let repo = std::path::absolute(expand_tilde(&args.repo))?;
+    let mut spec = new.spec;
+    let repo = std::path::absolute(expand_tilde(&spec.repo))?;
+    spec.repo = PathBuf::from(contract_tilde(&repo));
+    let mut task = Task::new(id, spec, prompt);
+    task.created_by = Some(new.created_by);
+    task.scheduled_at = new.scheduled_at;
+
+    let problems = task.problems(config, None);
+    if !problems.is_empty() {
+        bail!("invalid task:\n  - {}", problems.join("\n  - "));
+    }
+    let path = home.tasks().join(format!("{}.md", task.id));
+    task.create(&path)?;
+    Ok((task, path))
+}
+
+pub fn add(home: &Home, args: AddArgs) -> Result<()> {
+    home.ensure_initialized()?;
+    let config = Config::load(&home.config_path())?;
+
+    let prompt = read_prompt(args.text.or(args.prompt))?;
+    let repo = match args.repo {
+        Some(repo) => repo,
+        None => current_repo()?,
+    };
     let spec = TaskSpec {
-        repo: PathBuf::from(contract_tilde(&repo)),
+        repo,
         branch: args.branch,
         worktree: args.no_worktree.then_some(false),
         agent: args.agent,
@@ -292,22 +366,90 @@ pub fn add(home: &Home, args: AddArgs) -> Result<()> {
         retry_delay: args.retry_delay,
         timeout: args.timeout,
     };
-    let mut task = Task::new(id, spec, prompt);
-    task.created_by = Some(args.created_by);
-    task.scheduled_at = match (args.at, args.delay) {
+    let scheduled_at = match (args.at, args.delay) {
         (Some(at), _) => Some(at),
         (None, Some(delay)) => Some(now() + delay),
         (None, None) => None,
     };
+    let (task, path) = create_task(
+        home,
+        &config,
+        NewTask {
+            prompt,
+            id: args.id,
+            spec,
+            scheduled_at,
+            created_by: args.created_by,
+        },
+    )?;
 
-    let problems = task.problems(&config, None);
-    if !problems.is_empty() {
-        bail!("invalid task:\n  - {}", problems.join("\n  - "));
+    if std::io::stdout().is_terminal() {
+        print_queued(home, &config, &task);
+    } else {
+        // Scripts and agents read the path of the new file.
+        println!("{}", path.display());
     }
-    let path = home.tasks().join(format!("{}.md", task.id));
-    task.create(&path)?;
-    println!("{}", path.display());
     Ok(())
+}
+
+/// The given prompt, else the one piped on stdin, else (on a terminal) the
+/// one the user types.
+fn read_prompt(given: Option<String>) -> Result<String> {
+    if let Some(prompt) = given {
+        return Ok(prompt);
+    }
+    if std::io::stdin().is_terminal() {
+        let prompt = skill::prompt("What should the agent do? ")?;
+        if prompt.is_empty() {
+            bail!("the prompt is empty");
+        }
+        return Ok(prompt);
+    }
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
+/// The git repo the user is standing in, for `lf add` without `--repo`.
+fn current_repo() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("finding the current folder")?;
+    crate::git::repo_root(&cwd).map_err(|_| {
+        anyhow::anyhow!(
+            "{} isn't inside a git repository: run `lf add` from your project's folder, \
+             or say where with --repo <path>",
+            contract_tilde(&cwd)
+        )
+    })
+}
+
+/// Plain-language confirmation for a person at a terminal, and what to do next.
+fn print_queued(home: &Home, config: &Config, task: &Task) {
+    let eff = task.spec.resolve(&config.defaults);
+    println!("Queued `{}`", task.id);
+    println!("  repo       {}", contract_tilde(&eff.repo));
+    println!("  agent      {}", eff.agent.as_deref().unwrap_or("-"));
+    match task.scheduled_at {
+        Some(at) => println!("  starts     {}", fmt_time(at)),
+        None => println!("  starts     as soon as the runner picks it up"),
+    }
+    println!("  when done  {}", describe_on_finish(eff.on_finish));
+    println!();
+    if home.runner_alive() {
+        println!(
+            "The runner is up, so it will start on its own. Follow along with `lf ls --watch`."
+        );
+    } else {
+        println!("Nothing runs it yet: start the runner (and the dashboard) with `lf start`.");
+    }
+}
+
+fn describe_on_finish(on_finish: OnFinish) -> &'static str {
+    match on_finish {
+        OnFinish::None => "leave the changes for you to review",
+        OnFinish::Commit => "commit the changes",
+        OnFinish::Push => "commit and push the changes",
+        OnFinish::Pr => "commit, push and open a pull request",
+    }
 }
 
 fn id_taken(home: &Home, id: &str) -> bool {

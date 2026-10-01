@@ -20,9 +20,30 @@ init` puts an `AGENTS.md` and an `lf-tasks` skill there, which teach the agent
 to write a self-contained prompt and queue it with `lf add`. It can also link
 the skill into your global skill folders, so you can queue work from any repo.
 
+## Quick start
+
+```sh
+# 1. install (Linux or macOS; needs git and tmux)
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/giannileggio/loompa-forge/releases/latest/download/loompa-forge-installer.sh | sh
+
+# 2. queue some work, from inside your project
+cd ~/Projects/myapp
+lf add "Fix the redirect loop after login"
+
+# 3. run it (starts the runner and opens the dashboard)
+lf start
+```
+
+That's all: the first command you run sets up `~/.loompa-forge` and picks the
+coding agent it finds on your `PATH`, and `lf add` works on the git repo you're
+standing in. In the dashboard, **+ New task** queues more work without the
+terminal. Run `lf` on its own any time to see where things stand and what to
+try next, and `lf doctor` if something isn't running.
+
 ## Status
 
-Working now: `init`, `add`, `ls`, `validate`, `lf run` (the runner and
+Working now: `init`, `add`, `ls`, `validate`, `start`, `lf run` (the runner and
 scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`),
 `done|fail|cancel|retry|attach`, `logs`, `clean`, `web` (a dashboard you can
 also act from), `status`/`doctor`/`service` (keeping the runner healthy), and
@@ -33,8 +54,9 @@ the agent skill for writing tasks.
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/giannileggio/loompa-forge/releases/latest/download/loompa-forge-installer.sh | sh
-lf init            # creates ~/.loompa-forge (override with $LF_HOME or --home);
-                   # asks for the default agent and whether to install the skill globally
+lf init            # optional: the first `lf add`/`lf start` sets up ~/.loompa-forge by
+                   # itself (override with $LF_HOME or --home). `lf init` also asks
+                   # whether to install the skill globally, so agents can queue tasks
 ```
 
 Prebuilt binaries are published for Linux and macOS (x86_64 and arm64); the
@@ -52,9 +74,12 @@ cargo install --path .
 ## Usage
 
 ```sh
+lf add "Fix the redirect loop after login"   # in the repo you're in; asks if you leave the text out
 lf add --repo ~/Projects/myapp --on-finish pr --in 2h \
-       --prompt "Fix the redirect loop after login"
+       "Fix the redirect loop after login"
 echo "Update deps and run tests" | lf add --repo ~/Projects/myapp --agent codex
+
+lf start             # the runner and the dashboard together (--no-open: no browser)
 
 lf ls                # queue
 lf ls --schedules    # schedules with their next run
@@ -125,7 +150,9 @@ What `lf` does so that a bad day doesn't lose work:
 
 `lf web` serves a local dashboard (queue, running, archive and schedules,
 refreshed every couple of seconds) — a Sidekiq-style view of the same state
-`lf ls` prints. Each task row offers the buttons that make sense for its
+`lf ls` prints. **+ New task** queues work from a form (what to do, which
+project, when to start, what to do with the result), calling the same code as
+`lf add`; `lf start` is `lf web` plus a runner that stops with it. Each task row offers the buttons that make sense for its
 status (done, fail, cancel, retry) plus a log viewer, calling the same code
 as `lf done|fail|cancel|retry` and `lf logs`. It only binds to
 `127.0.0.1`, so anyone who can reach it could already run `lf` locally

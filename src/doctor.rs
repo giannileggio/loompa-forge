@@ -48,7 +48,9 @@ pub fn status(home: &Home) -> Result<()> {
             println!("           last pass failed: {err}");
         }
     } else {
-        println!("runner     NOT running: start it with `lf run` (`lf service` keeps it up)");
+        println!(
+            "runner     NOT running: start it with `lf start` (or `lf run`; `lf service` keeps it up)"
+        );
     }
 
     let load = |dir: std::path::PathBuf| -> Vec<Task> {

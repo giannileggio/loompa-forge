@@ -151,6 +151,37 @@
     background: var(--failed); color: #fff; font-size: 13px; display: none; z-index: 20;
   }
   .toast.active { display: block; }
+  header .primary {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  header .primary:hover { filter: brightness(1.1); }
+  .toast.ok { background: var(--done); }
+  .notice {
+    margin: 12px 20px 0; padding: 10px 14px; border-radius: 6px; font-size: 13px;
+    border: 1px solid var(--review); background: rgba(217,119,6,.1);
+  }
+  .notice[hidden] { display: none; }
+  .empty .big { font-size: 16px; color: var(--text); margin-bottom: 6px; }
+  .empty button { margin-top: 12px; }
+  .btn {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .btn.secondary { background: none; color: var(--text); border: 1px solid var(--border); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  form.new-task { padding: 16px; display: flex; flex-direction: column; gap: 14px; overflow: auto; }
+  form.new-task label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 600; }
+  form.new-task label small { font-weight: 400; color: var(--muted); }
+  form.new-task textarea, form.new-task input, form.new-task select {
+    font: inherit; font-weight: 400; padding: 8px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  }
+  form.new-task textarea { min-height: 110px; resize: vertical; }
+  form.new-task .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 560px) { form.new-task .row { grid-template-columns: 1fr; } }
+  form.new-task .buttons { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+  form.new-task .error { color: var(--failed); font-size: 12px; margin-right: auto; white-space: pre-line; }
   .warn { margin: 8px 16px; padding: 8px 12px; border: 1px solid var(--failed); border-radius: 6px; font-size: 13px; }
   .warn[hidden] { display: none; }
 </style>
@@ -161,7 +192,14 @@
   <span class="home mono" id="home"></span>
   <span class="updated" id="runner"></span>
   <span class="updated"><span class="dot"></span>as of <span id="updated">-</span></span>
+  <button class="primary" id="new-task-open">+ New task</button>
 </header>
+
+<div class="notice" id="runner-notice" hidden>
+  <strong>Nothing will start yet: the runner isn't running.</strong>
+  Stop this and run <code>lf start</code> instead of <code>lf web</code>, or run
+  <code>lf run</code> in another terminal. Tasks you add now wait in the queue.
+</div>
 
 <div class="stats" id="stats"></div>
 <div class="warn" id="invalid" hidden></div>
@@ -189,6 +227,53 @@
     <pre id="logs-body">loading&hellip;</pre>
   </div>
 </div>
+
+<div class="overlay" id="new-overlay">
+  <div class="modal">
+    <header>
+      <h2>New task</h2>
+      <button id="new-close" aria-label="Close">&times;</button>
+    </header>
+    <form class="new-task" id="new-form">
+      <label>What should the agent do?
+        <textarea id="f-prompt" required autofocus
+          placeholder="e.g. Fix the redirect loop after login, and add a test for it"></textarea>
+        <small>Write it like a message to a teammate. Include anything it can't guess.</small>
+      </label>
+      <label>Which project?
+        <input id="f-repo" list="f-repos" required autocomplete="off" placeholder="~/Projects/myapp">
+        <datalist id="f-repos"></datalist>
+        <small>The folder of a git repository on this machine.</small>
+      </label>
+      <div class="row">
+        <label>Start
+          <select id="f-start">
+            <option value="asap">As soon as possible</option>
+            <option value="1h">In 1 hour</option>
+            <option value="3h">In 3 hours</option>
+            <option value="8h">In 8 hours</option>
+          </select>
+        </label>
+        <label>When it's done
+          <select id="f-finish">
+            <option value="none">Leave the changes for me to review</option>
+            <option value="commit">Commit them</option>
+            <option value="push">Commit and push</option>
+            <option value="pr">Open a pull request</option>
+          </select>
+        </label>
+      </div>
+      <label id="f-agent-wrap" hidden>Agent
+        <select id="f-agent"></select>
+      </label>
+      <div class="buttons">
+        <span class="error" id="f-error"></span>
+        <button type="button" class="btn secondary" id="new-cancel">Cancel</button>
+        <button type="submit" class="btn" id="f-submit">Queue task</button>
+      </div>
+    </form>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -212,8 +297,8 @@ function badge(status) {
   return `<span class="badge ${escapeHtml(status)}">${escapeHtml(status.replace("_", " "))}</span>`;
 }
 
-function taskTable(rows, cols) {
-  if (rows.length === 0) return `<div class="empty">Nothing here.</div>`;
+function taskTable(rows, cols, empty) {
+  if (rows.length === 0) return empty || `<div class="empty">Nothing here.</div>`;
   const head = cols.map(c => `<th>${escapeHtml(c.label)}</th>`).join("");
   const body = rows.map(r => `<tr>${cols.map(c => `<td class="${c.mono ? "mono" : ""}">${c.render ? c.render(r) : escapeHtml(r[c.key])}</td>`).join("")}</tr>`).join("");
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
@@ -276,7 +361,9 @@ async function refresh() {
   const runner = document.getElementById("runner");
   runner.textContent = state.runner.alive
     ? `runner: running${state.runner.last_tick ? ` (last pass ${state.runner.last_tick})` : ""}`
-    : "runner: not running (start it with `lf run`)";
+    : "runner: not running";
+  document.getElementById("runner-notice").hidden = state.runner.alive;
+  formInfo = state.form;
 
   const invalid = document.getElementById("invalid");
   invalid.hidden = state.invalid.length === 0;
@@ -292,8 +379,14 @@ async function refresh() {
     document.getElementById(`c-${tab}`).textContent = state[tab].length;
   }
 
-  document.getElementById("panel-queue").innerHTML = taskTable(state.queue, TASK_COLS);
-  document.getElementById("panel-running").innerHTML = taskTable(state.running, TASK_COLS);
+  const firstRun = state.queue.length + state.running.length + state.archive.length === 0;
+  document.getElementById("panel-queue").innerHTML = taskTable(state.queue, TASK_COLS, firstRun
+    ? `<div class="empty"><div class="big">No tasks yet</div>
+         Describe some work and an agent will do it while you're away.<br>
+         <button class="btn" data-action="new">+ New task</button></div>`
+    : `<div class="empty">The queue is empty.</div>`);
+  document.getElementById("panel-running").innerHTML = taskTable(state.running, TASK_COLS,
+    `<div class="empty">Nothing running right now.</div>`);
   document.getElementById("panel-archive").innerHTML = taskTable(state.archive, TASK_COLS);
   document.getElementById("panel-schedules").innerHTML = taskTable(state.schedules, SCHEDULE_COLS);
 }
@@ -306,9 +399,10 @@ document.getElementById("tabs").addEventListener("click", (e) => {
 });
 
 let toastTimer = null;
-function toast(msg) {
+function toast(msg, ok) {
   const el = document.getElementById("toast");
   el.textContent = msg;
+  el.classList.toggle("ok", !!ok);
   el.classList.add("active");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove("active"), 4000);
@@ -363,11 +457,87 @@ document.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-action]");
   if (!btn) return;
   const { id, action } = btn.dataset;
-  if (action === "logs") {
+  if (action === "new") {
+    openNewTask();
+  } else if (action === "logs") {
     showLogs(id);
   } else {
     runAction(id, action);
   }
+});
+
+// ---- New task form
+
+let formInfo = null;
+const newOverlay = document.getElementById("new-overlay");
+const newForm = document.getElementById("new-form");
+const fError = document.getElementById("f-error");
+const fSubmit = document.getElementById("f-submit");
+
+function openNewTask() {
+  const info = formInfo || { repos: [], agents: [], agent: null, on_finish: "none" };
+  const repo = document.getElementById("f-repo");
+  if (!repo.value && info.repos.length) repo.value = info.repos[0];
+  document.getElementById("f-repos").innerHTML =
+    info.repos.map(r => `<option value="${escapeHtml(r)}"></option>`).join("");
+  document.getElementById("f-finish").value = info.on_finish;
+  // Only worth asking when there's a real choice of agent.
+  const agentWrap = document.getElementById("f-agent-wrap");
+  const agent = document.getElementById("f-agent");
+  agentWrap.hidden = info.agents.length < 2;
+  agent.innerHTML = info.agents.map(a =>
+    `<option value="${escapeHtml(a)}"${a === info.agent ? " selected" : ""}>${escapeHtml(a)}</option>`
+  ).join("");
+  fError.textContent = "";
+  newOverlay.classList.add("active");
+  document.getElementById("f-prompt").focus();
+}
+
+function closeNewTask() { newOverlay.classList.remove("active"); }
+
+document.getElementById("new-task-open").addEventListener("click", openNewTask);
+document.getElementById("new-close").addEventListener("click", closeNewTask);
+document.getElementById("new-cancel").addEventListener("click", closeNewTask);
+newOverlay.addEventListener("click", (e) => { if (e.target === newOverlay) closeNewTask(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { closeNewTask(); logsOverlay.classList.remove("active"); }
+});
+// Cmd/Ctrl+Enter submits from the prompt box.
+document.getElementById("f-prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) newForm.requestSubmit();
+});
+
+newForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  fError.textContent = "";
+  fSubmit.disabled = true;
+  const agentWrap = document.getElementById("f-agent-wrap");
+  const body = {
+    prompt: document.getElementById("f-prompt").value,
+    repo: document.getElementById("f-repo").value,
+    start: document.getElementById("f-start").value,
+    on_finish: document.getElementById("f-finish").value,
+    agent: agentWrap.hidden ? null : document.getElementById("f-agent").value,
+  };
+  try {
+    const res = await fetch("/api/tasks", {
+      method: "POST",
+      headers: { "X-LF-Token": TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      fError.textContent = data.error || "couldn't queue the task";
+    } else {
+      document.getElementById("f-prompt").value = "";
+      closeNewTask();
+      toast(`Queued ${data.id}`, true);
+      refresh();
+    }
+  } catch (err) {
+    fError.textContent = String(err);
+  }
+  fSubmit.disabled = false;
 });
 
 refresh();

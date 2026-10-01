@@ -1,26 +1,28 @@
 //! `lf web`: a Sidekiq-style dashboard over the queue, with actions.
 //!
 //! Serves one HTML shell, a `/api/state` JSON endpoint the page polls, a
-//! `/api/tasks/<id>/logs` endpoint, and `/api/tasks/<id>/{done,fail,cancel,retry}`
+//! `/api/tasks/<id>/logs` endpoint, `/api/tasks/<id>/{done,fail,cancel,retry}`
 //! POST routes that call straight into the same code `lf done|fail|cancel|retry`
-//! use. Only binds to 127.0.0.1, but a web page you visit can still send
+//! use, and `POST /api/tasks` to queue a new task (the "New task" form). Only binds to 127.0.0.1, but a web page you visit can still send
 //! requests there, so every request must carry a loopback `Host` (defeats DNS
 //! rebinding), and POSTs a per-run token that only the dashboard page itself
 //! can read (defeats cross-site forgery) and a loopback `Origin`, if any.
 
 use std::cmp::Reverse;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-use crate::cmd::md_files;
-use crate::config::Config;
+use crate::cmd::{NewTask, create_task, md_files};
+use crate::config::{Config, on_path};
 use crate::control;
 use crate::home::{Home, contract_tilde};
 use crate::run::RunnerState;
 use crate::schedule::Schedule;
+use crate::spec::{OnFinish, TaskSpec};
 use crate::task::{Status, Task, fmt_cost, fmt_tokens, now};
 
 #[derive(clap::Args)]
@@ -28,6 +30,9 @@ pub struct WebArgs {
     /// Port to listen on.
     #[arg(long, default_value_t = 7433)]
     port: u16,
+    /// Don't open the dashboard in a browser.
+    #[arg(long)]
+    no_open: bool,
 }
 
 const INDEX_HTML: &str = include_str!("web_dashboard.html");
@@ -43,6 +48,8 @@ struct Ctx<'a> {
     home: &'a Home,
     token: String,
     index: String,
+    /// The git repo `lf web` was started in, offered first in the new-task form.
+    cwd_repo: Option<String>,
 }
 
 struct Reply {
@@ -65,17 +72,52 @@ fn json_reply(status: u16, body: String) -> Reply {
 
 pub fn serve(home: &Home, args: WebArgs) -> Result<()> {
     home.ensure_initialized()?;
+    let (server, addr) = bind(&args)?;
+    run_server(home, server, &addr, &args)
+}
+
+/// `lf start`: the runner and the dashboard in one command. The runner
+/// stops when the dashboard does, so there's nothing to clean up.
+pub fn start(home: &Home, args: WebArgs) -> Result<()> {
+    home.ensure_initialized()?;
+    let (server, addr) = bind(&args)?;
+    let _runner = if home.runner_alive() {
+        println!("The runner is already running.");
+        None
+    } else {
+        Some(spawn_runner(home)?)
+    };
+    run_server(home, server, &addr, &args)
+}
+
+fn bind(args: &WebArgs) -> Result<(Server, String)> {
     let addr = format!("127.0.0.1:{}", args.port);
-    let server = Server::http(&addr)
-        .map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))
-        .with_context(|| format!("starting `lf web` on {addr}"))?;
+    let server = Server::http(&addr).map_err(|e| {
+        anyhow::anyhow!(
+            "couldn't listen on {addr}: {e}. If `lf web` or `lf start` is already running, \
+             open http://{addr}; otherwise pick another port with --port"
+        )
+    })?;
+    Ok((server, addr))
+}
+
+fn run_server(home: &Home, server: Server, addr: &str, args: &WebArgs) -> Result<()> {
     let token = random_token()?;
+    let cwd_repo = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| crate::git::repo_root(&cwd).ok())
+        .map(|root| contract_tilde(&root));
     let ctx = Ctx {
         home,
         index: INDEX_HTML.replace("__LF_TOKEN__", &token),
         token,
+        cwd_repo,
     };
-    println!("lf web on http://{addr}  (Ctrl-C to stop)");
+    let url = format!("http://{addr}");
+    println!("Dashboard: {url}  (Ctrl-C to stop)");
+    if !args.no_open && std::io::stdout().is_terminal() {
+        open_browser(&url);
+    }
 
     std::thread::scope(|scope| {
         for _ in 0..WORKERS {
@@ -87,6 +129,53 @@ pub fn serve(home: &Home, args: WebArgs) -> Result<()> {
         }
     });
     Ok(())
+}
+
+/// A background `lf run`, killed when dropped.
+struct RunnerChild(Child);
+
+impl Drop for RunnerChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_runner(home: &Home) -> Result<RunnerChild> {
+    let exe = std::env::current_exe().context("finding the lf binary to start the runner")?;
+    let child = Command::new(exe)
+        .arg("--home")
+        .arg(home.root())
+        .arg("run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting the runner")?;
+    println!(
+        "Runner started (it logs to {})",
+        contract_tilde(&home.runner_log())
+    );
+    Ok(RunnerChild(child))
+}
+
+/// Opens `url` in the default browser, if this machine has a way to. Never
+/// an error: the URL is printed either way.
+fn open_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let _ = Command::new(opener)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
 }
 
 fn handle(ctx: &Ctx, mut request: Request) {
@@ -148,7 +237,7 @@ fn route(ctx: &Ctx, method: &Method, url: &str, body: &str) -> Reply {
     match method {
         Method::Get => match segments.as_slice() {
             [] => reply(200, "text/html; charset=utf-8", ctx.index.clone()),
-            ["api", "state"] => match state_json(home) {
+            ["api", "state"] => match state_json(home, ctx.cwd_repo.as_deref()) {
                 Ok(json) => json_reply(200, json),
                 Err(e) => json_reply(500, json_err(&e)),
             },
@@ -162,6 +251,10 @@ fn route(ctx: &Ctx, method: &Method, url: &str, body: &str) -> Reply {
             _ => reply(404, "text/plain", "not found"),
         },
         Method::Post => match segments.as_slice() {
+            ["api", "tasks"] => match perform_create(home, body) {
+                Ok(id) => json_reply(200, serde_json::json!({ "ok": true, "id": id }).to_string()),
+                Err(e) => json_reply(400, json_err(&e)),
+            },
             ["api", "tasks", id, action] if ACTIONS.contains(action) => {
                 match perform_action(home, id, action, body) {
                     Ok(()) => json_reply(200, "{\"ok\":true}".into()),
@@ -220,6 +313,72 @@ fn perform_action(home: &Home, id: &str, action: &str, body: &str) -> Result<()>
         "cancel" => control::cancel(home, Some(id.to_string())),
         "retry" => control::retry(home, id),
         _ => unreachable!("route only matches ACTIONS"),
+    }
+}
+
+/// The "New task" form.
+#[derive(Deserialize)]
+struct NewTaskBody {
+    prompt: String,
+    repo: String,
+    /// `asap` (or empty), or a delay like `1h`.
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    on_finish: Option<OnFinish>,
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+/// Queues the task described by the form, as `lf add` would. Returns its id.
+fn perform_create(home: &Home, body: &str) -> Result<String> {
+    let form: NewTaskBody = serde_json::from_str(body).context("couldn't read the form")?;
+    let repo = form.repo.trim();
+    if repo.is_empty() {
+        anyhow::bail!("choose the repository the agent should work in");
+    }
+    let scheduled_at = match form.start.as_deref().map(str::trim) {
+        None | Some("") | Some("asap") => None,
+        Some(delay) => {
+            let delay = humantime::parse_duration(delay)
+                .map_err(|e| anyhow::anyhow!("can't start after `{delay}`: {e}"))?;
+            Some(now() + delay)
+        }
+    };
+    let config = Config::load(&home.config_path())?;
+    let spec = TaskSpec {
+        repo: repo.into(),
+        branch: None,
+        worktree: None,
+        agent: form.agent.filter(|a| !a.trim().is_empty()),
+        model: None,
+        mode: None,
+        on_finish: form.on_finish,
+        retries: None,
+        retry_delay: None,
+        timeout: None,
+    };
+    let created = create_task(
+        home,
+        &config,
+        NewTask {
+            prompt: form.prompt,
+            id: None,
+            spec,
+            scheduled_at,
+            created_by: "web".into(),
+        },
+    );
+    match created {
+        Ok((task, _)) => Ok(task.id),
+        // The form shows one plain sentence, not the CLI's bulleted list.
+        Err(e) => {
+            let message = format!("{e:#}");
+            match message.strip_prefix("invalid task:\n  - ") {
+                Some(problems) => anyhow::bail!("{}", problems.replace("\n  - ", "; ")),
+                None => Err(e),
+            }
+        }
     }
 }
 
@@ -287,6 +446,17 @@ struct Counts {
     invalid: usize,
 }
 
+/// What the "New task" form offers and pre-selects.
+#[derive(Serialize)]
+struct FormInfo {
+    /// Repos to suggest, most relevant first.
+    repos: Vec<String>,
+    agents: Vec<String>,
+    /// The default agent, if one is set.
+    agent: Option<String>,
+    on_finish: &'static str,
+}
+
 #[derive(Serialize)]
 struct State {
     home: String,
@@ -298,6 +468,7 @@ struct State {
     schedules: Vec<ScheduleRow>,
     invalid: Vec<InvalidRow>,
     runner: RunnerRow,
+    form: FormInfo,
 }
 
 /// Loads every file in `paths`, setting aside the ones that don't parse
@@ -320,7 +491,7 @@ fn load_all<T>(
     ok
 }
 
-fn state_json(home: &Home) -> Result<String> {
+fn state_json(home: &Home, cwd_repo: Option<&str>) -> Result<String> {
     let mut invalid = Vec::new();
     let config = Config::load(&home.config_path()).unwrap_or_else(|e| {
         invalid.push(InvalidRow {
@@ -351,6 +522,11 @@ fn state_json(home: &Home) -> Result<String> {
         }
     }
     archive_tasks.sort_by_key(|t| Reverse(t.finished_at));
+    let form = form_info(
+        &config,
+        cwd_repo,
+        &[&running_tasks, &queue_tasks, &archive_tasks],
+    );
 
     let schedules: Vec<ScheduleRow> =
         load_all(md_files(&home.schedules())?, Schedule::load, &mut invalid)
@@ -388,8 +564,48 @@ fn state_json(home: &Home) -> Result<String> {
                 .and_then(|s| s.last_tick_at)
                 .map(fmt_time),
         },
+        form,
     };
     Ok(serde_json::to_string(&state)?)
+}
+
+/// Repos from the folder `lf web` started in, then from recent tasks (newest
+/// first, each once), plus the configured agents and finish action.
+fn form_info(config: &Config, cwd_repo: Option<&str>, tasks: &[&Vec<Task>]) -> FormInfo {
+    let mut recent: Vec<&Task> = tasks.iter().flat_map(|t| t.iter()).collect();
+    recent.sort_by_key(|t| Reverse(t.created_at));
+    let mut repos: Vec<String> = Vec::new();
+    for repo in cwd_repo.map(str::to_string).into_iter().chain(
+        recent
+            .iter()
+            .map(|t| contract_tilde(&t.spec.resolve(&config.defaults).repo)),
+    ) {
+        if !repos.contains(&repo) {
+            repos.push(repo);
+        }
+    }
+    // Only agents that can actually run here (the default always counts), so
+    // the form doesn't offer a choice that would just fail.
+    let agents = config
+        .agents
+        .iter()
+        .filter(|(name, agent)| {
+            config.defaults.agent.as_deref() == Some(name.as_str())
+                || agent.headless.first().is_some_and(|p| on_path(p))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    FormInfo {
+        repos,
+        agents,
+        agent: config.defaults.agent.clone(),
+        on_finish: match config.defaults.on_finish {
+            OnFinish::None => "none",
+            OnFinish::Commit => "commit",
+            OnFinish::Push => "push",
+            OnFinish::Pr => "pr",
+        },
+    }
 }
 
 fn to_row(t: &Task, config: &Config) -> Row {

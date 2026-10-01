@@ -268,11 +268,107 @@ fn logs_reads_a_saved_attempt_via_the_cli() {
 }
 
 #[test]
-fn commands_fail_clearly_before_init() {
+fn commands_that_need_existing_state_fail_clearly_before_init() {
     let home = tempfile::tempdir().unwrap();
 
-    let out = failed(run(lf(home.path()).arg("ls")));
+    let out = failed(run(lf(home.path()).args(["done", "some-task"])));
     assert!(stderr(&out).contains("not initialized"));
+}
+
+#[test]
+fn first_use_sets_everything_up() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = ok(run(lf(home.path()).arg("ls")));
+    assert!(stderr(&out).contains("First run"));
+    assert!(!stdout(&out).contains("First run"));
+    assert!(home.path().join("config.toml").is_file());
+    assert!(home.path().join("tasks").is_dir());
+
+    // The second time it's just the listing.
+    let out = ok(run(lf(home.path()).arg("ls")));
+    assert!(!stderr(&out).contains("First run"));
+}
+
+/// A throwaway git repository.
+fn git_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repo.path())
+        .status()
+        .expect("running git");
+    assert!(status.success());
+    repo
+}
+
+#[test]
+fn add_needs_no_flags_inside_a_repo() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = git_repo();
+    init(home.path());
+
+    let out = ok(run(lf(home.path())
+        .current_dir(repo.path())
+        .args(["add", "Fix the login redirect"])));
+    assert!(
+        stdout(&out)
+            .trim_end()
+            .ends_with("fix-the-login-redirect.md")
+    );
+
+    let task =
+        std::fs::read_to_string(home.path().join("tasks/fix-the-login-redirect.md")).unwrap();
+    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    assert!(task.contains(repo_name), "{task}");
+    assert!(task.contains("Fix the login redirect"));
+}
+
+#[test]
+fn add_outside_a_repo_says_what_to_do() {
+    let home = tempfile::tempdir().unwrap();
+    let not_a_repo = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    let out = failed(run(lf(home.path())
+        .current_dir(not_a_repo.path())
+        .args(["add", "Fix it"])));
+    let err = stderr(&out);
+    assert!(err.contains("isn't inside a git repository"), "{err}");
+    assert!(err.contains("--repo"), "{err}");
+}
+
+#[test]
+fn the_prompt_is_positional_or_a_flag_but_not_both() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = git_repo();
+    init(home.path());
+
+    ok(run(lf(home.path())
+        .current_dir(repo.path())
+        .args(["add", "--prompt", "via flag", "--id", "flagged"])));
+    failed(run(lf(home.path()).current_dir(repo.path()).args([
+        "add",
+        "positional",
+        "--prompt",
+        "and flag",
+    ])));
+}
+
+#[test]
+fn bare_lf_explains_how_to_start() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = stdout(&ok(run(&mut lf(home.path()))));
+    assert!(out.contains("lf add"), "{out}");
+    assert!(out.contains("lf start"), "{out}");
+    // It only explains: nothing gets created.
+    assert!(!home.path().join("tasks").exists());
+
+    init(home.path());
+    let out = stdout(&ok(run(&mut lf(home.path()))));
+    assert!(out.contains("runner"), "{out}");
+    assert!(out.contains("lf start"), "{out}");
 }
 
 #[test]
@@ -520,4 +616,122 @@ fn web_serves_the_dashboard_and_state() {
 
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+#[test]
+fn web_new_task_form_queues_a_task() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = git_repo();
+    init(home.path());
+
+    let port = 18341u16;
+    let mut child = lf(home.path())
+        .args(["web", "--no-open", "--port", &port.to_string()])
+        .current_dir(repo.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let token = page_token(port);
+
+    // Started inside a repo, so the form suggests it.
+    let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+    let state = http_get(port, "/api/state");
+    assert!(state.contains("\"form\""), "{state}");
+    assert!(state.contains(repo_name), "{state}");
+
+    let form = serde_json::json!({
+        "prompt": "Tidy up the README\n\nMore detail here.",
+        "repo": repo.path(),
+        "start": "1h",
+        "on_finish": "commit",
+        "agent": "claude",
+    })
+    .to_string();
+    let made = http_post(port, &token, "/api/tasks", &form);
+    assert!(made.starts_with("HTTP/1.1 200"), "{made}");
+    assert!(made.contains("\"id\":\"tidy-up-the-readme\""), "{made}");
+
+    let task = std::fs::read_to_string(home.path().join("tasks/tidy-up-the-readme.md")).unwrap();
+    assert!(task.contains("on_finish: commit"), "{task}");
+    assert!(task.contains("created_by: web"), "{task}");
+    assert!(task.contains("scheduled_at"), "{task}");
+    assert!(task.contains("More detail here."), "{task}");
+    assert!(http_get(port, "/api/state").contains("\"pending\":1"));
+
+    // Mistakes come back as a message the form can show, not a stack trace.
+    for (bad, expect) in [
+        (
+            r#"{"prompt":"  ","repo":"/tmp","agent":"claude"}"#,
+            "prompt is empty",
+        ),
+        (
+            r#"{"prompt":"x","repo":"","agent":"claude"}"#,
+            "choose the repository",
+        ),
+        (
+            r#"{"prompt":"x","repo":"/no/such/dir","agent":"claude"}"#,
+            "does not exist",
+        ),
+        (
+            r#"{"prompt":"x","repo":"/tmp","start":"soonish"}"#,
+            "can't start after",
+        ),
+        (r#"not json"#, "couldn't read the form"),
+    ] {
+        let out = http_post(port, &token, "/api/tasks", bad);
+        assert!(out.starts_with("HTTP/1.1 400"), "{bad}: {out}");
+        assert!(out.contains(expect), "{bad}: {out}");
+        assert!(!out.contains("invalid task"), "{bad}: {out}");
+    }
+
+    // Like every POST, it needs the page's token.
+    let out = http(
+        port,
+        "POST",
+        "/api/tasks",
+        &format!("127.0.0.1:{port}"),
+        &[("Content-Type", "application/json")],
+        &form,
+    );
+    assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn start_runs_the_runner_and_the_dashboard_together() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    let port = 18342u16;
+    let mut child = lf(home.path())
+        .args(["start", "--no-open", "--port", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    page_token(port); // waits for the dashboard
+
+    // The runner comes up a moment after the page does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        let status = stdout(&ok(run(lf(home.path()).arg("status"))));
+        if status.contains("running (pid") || std::time::Instant::now() > deadline {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(status.contains("running (pid"), "{status}");
+    assert!(http_get(port, "/api/state").contains("\"alive\":true"));
+
+    // Ctrl-C reaches both in a terminal; here, stop each by hand.
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.path().join("runner.json")).unwrap())
+            .unwrap();
+    let runner_pid = state["pid"].as_u64().unwrap().to_string();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    Command::new("kill").arg(runner_pid).status().unwrap();
 }

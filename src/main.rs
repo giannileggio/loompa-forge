@@ -31,7 +31,7 @@ struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -98,6 +98,9 @@ enum Command {
     Clean(clean::CleanArgs),
     /// Serve a dashboard over the queue (with actions), until interrupted.
     Web(web::WebArgs),
+    /// Run the queue and serve the dashboard together: the one-command way to
+    /// get going. Opens the dashboard in your browser.
+    Start(web::WebArgs),
     /// Show whether the runner is alive, the queue, budget and failing schedules.
     Status,
     /// Check that tasks can run here: tools, config, agents, task files.
@@ -129,10 +132,27 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let home = Home::resolve(cli.home)?;
-    if !matches!(cli.command, Command::Exec { .. }) {
+    let Some(command) = cli.command else {
+        update_check::check(&home);
+        cmd::welcome(&home)?;
+        return Ok(ExitCode::SUCCESS);
+    };
+    if !matches!(command, Command::Exec { .. }) {
         update_check::check(&home);
     }
-    match cli.command {
+    // Commands that make sense on a fresh machine set it up themselves.
+    if matches!(
+        command,
+        Command::Ls { .. }
+            | Command::Add(_)
+            | Command::Run { .. }
+            | Command::Web(_)
+            | Command::Start(_)
+            | Command::Status
+    ) {
+        cmd::ensure_ready(&home)?;
+    }
+    match command {
         Command::Init(args) => cmd::init(&home, args)?,
         Command::Ls {
             archive,
@@ -151,6 +171,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Logs { id, attempt } => print!("{}", control::logs(&home, &id, attempt)?),
         Command::Clean(args) => clean::clean(&home, args)?,
         Command::Web(args) => web::serve(&home, args)?,
+        Command::Start(args) => web::start(&home, args)?,
         Command::Status => doctor::status(&home)?,
         Command::Doctor => return doctor::doctor(&home),
         Command::Service { manager } => doctor::service(&home, manager)?,
