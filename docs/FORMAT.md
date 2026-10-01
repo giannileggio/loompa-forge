@@ -8,9 +8,11 @@ All state lives under one folder: `$LF_HOME`, default `~/.loompa-forge`.
   tasks/         queue: one <id>.md per task
   schedules/     recurring task templates: one <id>.md per schedule
   archive/       finished tasks, moved out of tasks/
-  logs/          <id>.<attempt>.log (pane output), .exit (exit status) and
-                 .usage (token/cost usage, if the agent reports it) per run
+  logs/          <id>.<attempt>.log (the agent's output), .exit (exit status)
+                 and .usage (token/cost usage, if the agent reports it) per run
   worktrees/     <id>/: the git worktree a task runs in (kept until `lf clean`)
+  runner.log     what `lf run` did, appended (moved to runner.log.1 past 5 MB)
+  runner.json    `lf run`'s heartbeat: pid, start and last pass (see `lf status`)
   AGENTS.md      guide for any agent opened in this folder
   CLAUDE.md, GEMINI.md   `@AGENTS.md`, for agents that don't read AGENTS.md
   FORMAT.md      this document
@@ -77,11 +79,12 @@ Don't edit these by hand. Use `lf` commands to change the status.
 |---------------|---------|
 | `status`      | `pending` → `running` → `done` \| `failed` \| `cancelled` \| `needs_review` |
 | `attempts`    | Attempts started so far. |
+| `interruptions` | Attempts cut short from outside (tmux or the machine went away). They are requeued at once and don't count against `retries`, up to 5 times. |
 | `started_at`, `finished_at` | RFC 3339. |
 | `exit_code`   | Headless mode only. |
 | `tmux_window` | Where the task is or was running. |
 | `error`       | Last failure reason. |
-| `tokens_in`, `tokens_out` | Token usage, if the agent's headless mode reports it (built in for `claude`). |
+| `tokens_in`, `tokens_out` | Token usage summed over attempts, if the agent's headless mode reports it (built in for `claude`). |
 | `cost_usd`    | Cost in USD, same condition. |
 
 `needs_review` means an interactive session ended without signalling
@@ -103,7 +106,9 @@ Ending a session saves its output to the attempt's log first.
 
 `lf logs <id> [--attempt N]` prints that output: the live tmux pane for a
 task still running, else `logs/<id>.<attempt>.log` (the latest attempt by
-default).
+default). A headless agent's stdout and stderr are streamed to that file as
+they arrive (up to 64 MB per attempt), so the whole log survives tmux dying.
+Interactive sessions' logs are captured from the tmux pane when they end.
 
 `lf clean` removes `worktrees/<id>` of archived `done` tasks (`--all`: any
 archived task, and worktrees with no task file; `--older-than 7d`: only
@@ -124,9 +129,25 @@ A failed attempt (non-zero exit, signal, timeout, or a start error such as a
 worktree that can't be created) goes back to `pending` with `scheduled_at`
 pushed out by `retry_delay` while retries remain; then it's `failed`. A task
 that doesn't pass `lf validate` when its turn comes is failed without
-running. `timeout` applies to headless tasks only. If `on_finish` fails after
-the agent succeeded, the task is `failed` without a retry; its worktree
-keeps the work.
+running. `timeout` applies to headless tasks only (an interactive session
+waits for a human); when it hits, the agent's process group gets SIGTERM and,
+5 seconds later, SIGKILL. If `on_finish` fails after the agent succeeded, the
+task is `failed` without a retry; its worktree keeps the work. `on_finish:
+pr` doesn't open a second PR if the branch already has one, so `lf done` can
+be re-run after a partial failure.
+
+A running task whose tmux window is gone without an exit record (a reboot,
+a killed tmux server) is *interrupted*, not failed: it goes back to
+`pending` at once and starts again, in the same worktree, without using up a
+retry (see `interruptions`).
+
+`prompt` is passed to the agent as a single command-line argument, so it
+must stay under 100,000 bytes (`lf validate` and `lf add` check this): put
+long specifications in a file in the repo and point the prompt at it.
+
+With `worktree: true`, an existing `worktrees/<id>` is reused only if it's
+really a worktree of the task's repo. With `worktree: false`, `lf` refuses to
+switch the repo's branch while it has uncommitted changes.
 
 The agent runs with `LF_HOME` and `LF_TASK_ID` set.
 
@@ -141,6 +162,7 @@ the task it creates. It also adds:
 |--------------------|----------|---------|
 | `cron`             | yes      | 5-field cron expression in local time, e.g. `"0 2 * * *"`. Quote it. |
 | `enabled`          | no       | Default `true`. |
+| `allow_overlap`    | no       | Default `false`: a firing is skipped while the previous task from this schedule is still in `tasks/` (pending or running), so a slow task isn't joined by a pile of copies. |
 | `last_enqueued_at` | —        | Written by loompa-forge. |
 
 ```markdown
@@ -159,6 +181,8 @@ in `tasks/` with the schedule's fields and prompt and sets
 `created_by: schedule:<id>`. The first time `lf run` sees a schedule it only
 records `last_enqueued_at`; it fires from then on. Firings missed while
 `lf run` wasn't running collapse into one task, not one per missed slot.
+`lf run` logs a warning when a schedule's last 3 runs all failed, and
+`lf status` lists schedules whose last 2 did.
 
 ## Config — `config.toml`
 
@@ -179,6 +203,18 @@ model = "sonnet"                      # optional: this agent's default model
 placeholders. No shell is involved, so prompts need no quoting. A task's
 `model` (else the agent's `model`) fills `{model}` in `model_args`; with
 neither, nothing is added and the agent picks its own model.
+
+### Runner limits
+
+```toml
+[runner]
+daily_budget_usd = 20.0   # optional
+```
+
+Once the cost agents reported for tasks run today (local time) reaches
+`daily_budget_usd`, `lf run` starts no more tasks until tomorrow; running
+ones finish. Only agents that report a cost count (see below). `lf status`
+shows the day's spend.
 
 ### Token/cost usage
 

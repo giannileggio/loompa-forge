@@ -25,7 +25,8 @@ the skill into your global skill folders, so you can queue work from any repo.
 Working now: `init`, `add`, `ls`, `validate`, `lf run` (the runner and
 scheduler: tmux windows, git worktrees, retries, timeouts, `on_finish`),
 `done|fail|cancel|retry|attach`, `logs`, `clean`, `web` (a dashboard you can
-also act from), and the agent skill for writing tasks.
+also act from), `status`/`doctor`/`service` (keeping the runner healthy), and
+the agent skill for writing tasks.
 
 ## Install
 
@@ -76,6 +77,10 @@ lf clean             # remove worktrees of done tasks (-n: dry run)
 lf clean --all --older-than 7d   # ...and of failed/cancelled ones, a week on
 lf clean --archive --all --older-than 30d   # ...and their archived task files/logs
 
+lf status            # is the runner alive? queue, spend, failing schedules
+lf doctor            # check tmux/git/agents/config/task files; non-zero on problems
+lf service systemd   # print a unit that keeps `lf run` running (or: launchd)
+
 lf web               # dashboard at http://127.0.0.1:7433, until Ctrl-C
 lf web --port 8080   # a different port
 ```
@@ -90,12 +95,45 @@ retries failures after `retry_delay`, kills attempts that exceed `timeout`,
 runs `on_finish` on success, and moves finished tasks to `archive/`. Each
 attempt's output is saved to `logs/<id>.<attempt>.log`.
 
+## Keeping it running
+
+`lf run` is a plain foreground process; `lf service systemd` (Linux) or
+`lf service launchd` (macOS) prints a unit file, with install instructions,
+that starts it at login and restarts it if it dies. Only one runner per home
+is allowed. `lf status` shows whether it's alive and when its last pass was
+(it warns if the runner looks stuck), and `lf run` also appends to
+`runner.log` in the home folder.
+
+What `lf` does so that a bad day doesn't lose work:
+
+- **Crash-safe state.** Task, schedule and exit files are replaced atomically,
+  never left half-written.
+- **Nothing can hang it.** `git`, `gh` and `tmux` calls have timeouts and
+  can't prompt; `on_finish` (push, PR) runs outside the lock the other
+  commands share, and waiting for that lock gives up after two minutes.
+- **Reboots aren't failures.** A task whose tmux window vanished is requeued
+  at once without using a retry. Headless output is streamed to the log file
+  as it's produced, so it survives tmux dying too.
+- **Timeouts really stop the agent**: SIGTERM to its process group, then
+  SIGKILL.
+- **Guard rails.** A schedule won't enqueue a new run while its last one is
+  still queued (unless `allow_overlap: true`); `daily_budget_usd` stops new
+  tasks once the day's reported cost reaches it.
+- **Safe git handling.** A reused worktree must belong to the repo, `lf`
+  won't switch your checkout's branch over uncommitted changes, and
+  `on_finish: pr` won't open a second PR for a branch that has one.
+
 `lf web` serves a local dashboard (queue, running, archive and schedules,
 refreshed every couple of seconds) — a Sidekiq-style view of the same state
 `lf ls` prints. Each task row offers the buttons that make sense for its
 status (done, fail, cancel, retry) plus a log viewer, calling the same code
 as `lf done|fail|cancel|retry` and `lf logs`. It only binds to
 `127.0.0.1`, so anyone who can reach it could already run `lf` locally
-themselves; there's no separate login.
+themselves; there's no login. But a web page you visit can send requests to
+`127.0.0.1` too, so the server only answers loopback `Host` names (against DNS
+rebinding) and accepts actions only with a random per-run token that just the
+dashboard page itself can read (against cross-site forgery). A task or
+schedule file that can't be parsed shows up in a warning box instead of
+breaking the page.
 
 See [docs/FORMAT.md](docs/FORMAT.md) for the file formats.

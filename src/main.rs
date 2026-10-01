@@ -96,7 +96,7 @@ enum Command {
     /// deleted. With --archive, also deletes the archived task file and its
     /// logs, once its worktree is gone.
     Clean(clean::CleanArgs),
-    /// Serve a read-only dashboard over the queue, until interrupted.
+    /// Serve a dashboard over the queue (with actions), until interrupted.
     Web(web::WebArgs),
     /// Show whether the runner is alive, the queue, budget and failing schedules.
     Status,
