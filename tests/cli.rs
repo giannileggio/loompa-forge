@@ -299,9 +299,17 @@ fn ls_watch_refreshes_until_killed() {
     assert!(text.contains("\x1B[2J\x1B[H"));
 }
 
-/// A raw GET over TCP (no HTTP client dependency), retrying until the
-/// server is up. Panics if it never comes up within a few seconds.
-fn http_get(port: u16, path: &str) -> String {
+/// A raw HTTP request over TCP (no HTTP client dependency). `host` is the
+/// Host header sent. Retries the connection until the server is up, and
+/// panics if it never comes up within a few seconds.
+fn http(
+    port: u16,
+    method: &str,
+    path: &str,
+    host: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> String {
     use std::io::Read as _;
     use std::net::TcpStream;
     use std::time::{Duration, Instant};
@@ -310,11 +318,14 @@ fn http_get(port: u16, path: &str) -> String {
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(mut stream) => {
-                write!(
-                    stream,
-                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-                )
-                .unwrap();
+                let mut req = format!(
+                    "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n",
+                    body.len()
+                );
+                for (k, v) in headers {
+                    req.push_str(&format!("{k}: {v}\r\n"));
+                }
+                write!(stream, "{req}\r\n{body}").unwrap();
                 let mut resp = String::new();
                 stream.read_to_string(&mut resp).unwrap();
                 return resp;
@@ -325,21 +336,32 @@ fn http_get(port: u16, path: &str) -> String {
     }
 }
 
-/// A raw POST over TCP, once the server is already known to be up.
-fn http_post(port: u16, path: &str, body: &str) -> String {
-    use std::io::Read as _;
-    use std::net::TcpStream;
+fn http_get(port: u16, path: &str) -> String {
+    http(port, "GET", path, "127.0.0.1", &[], "")
+}
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    write!(
-        stream,
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
+/// A POST as the dashboard page itself would send it.
+fn http_post(port: u16, token: &str, path: &str, body: &str) -> String {
+    http(
+        port,
+        "POST",
+        path,
+        &format!("127.0.0.1:{port}"),
+        &[
+            ("X-LF-Token", token),
+            ("Origin", &format!("http://127.0.0.1:{port}")),
+            ("Content-Type", "application/json"),
+        ],
+        body,
     )
-    .unwrap();
-    let mut resp = String::new();
-    stream.read_to_string(&mut resp).unwrap();
-    resp
+}
+
+/// The per-run token `lf web` embeds in the dashboard page.
+fn page_token(port: u16) -> String {
+    let index = http_get(port, "/");
+    let marker = "name=\"lf-token\" content=\"";
+    let start = index.find(marker).expect("token meta tag") + marker.len();
+    index[start..start + 32].to_string()
 }
 
 #[test]
@@ -356,9 +378,9 @@ fn web_actions_mutate_tasks_through_the_api() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    http_get(port, "/"); // waits for the server to come up
+    let token = page_token(port); // also waits for the server to come up
 
-    let cancel = http_post(port, "/api/tasks/w1/cancel", "");
+    let cancel = http_post(port, &token, "/api/tasks/w1/cancel", "");
     assert!(cancel.starts_with("HTTP/1.1 200"), "{cancel}");
     assert!(cancel.contains("\"ok\":true"));
 
@@ -366,18 +388,104 @@ fn web_actions_mutate_tasks_through_the_api() {
     assert!(state.contains("\"cancelled\":1"));
     assert!(state.contains("\"pending\":0"));
 
-    let retry = http_post(port, "/api/tasks/w1/retry", "");
+    let retry = http_post(port, &token, "/api/tasks/w1/retry", "");
     assert!(retry.starts_with("HTTP/1.1 200"), "{retry}");
     let state = http_get(port, "/api/state");
     assert!(state.contains("\"pending\":1"));
 
-    let bad = http_post(port, "/api/tasks/w1/fail", "");
+    let bad = http_post(port, &token, "/api/tasks/w1/fail", "");
     assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
     assert!(bad.contains("\"error\""));
 
     let logs = http_get(port, "/api/tasks/w1/logs");
     assert!(logs.starts_with("HTTP/1.1 404"), "{logs}");
     assert!(logs.contains("hasn't started"));
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn web_refuses_cross_site_and_rebound_requests() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init(home.path());
+    add(home.path(), repo.path(), "w1", "do it");
+
+    let port = 18339u16;
+    let mut child = lf(home.path())
+        .args(["web", "--port", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let token = page_token(port);
+    let path = "/api/tasks/w1/cancel";
+    let own_host = format!("127.0.0.1:{port}");
+
+    // A page on another site: no token it could have read.
+    let forged = http(
+        port,
+        "POST",
+        path,
+        &own_host,
+        &[("Origin", "http://evil.example")],
+        "",
+    );
+    assert!(forged.starts_with("HTTP/1.1 403"), "{forged}");
+    // Right token but a foreign Origin.
+    let origin = http(
+        port,
+        "POST",
+        path,
+        &own_host,
+        &[("X-LF-Token", &token), ("Origin", "http://evil.example")],
+        "",
+    );
+    assert!(origin.starts_with("HTTP/1.1 403"), "{origin}");
+    // Wrong token.
+    let wrong = http(port, "POST", path, &own_host, &[("X-LF-Token", "nope")], "");
+    assert!(wrong.starts_with("HTTP/1.1 403"), "{wrong}");
+    // DNS rebinding: the browser sends the attacker's hostname.
+    let rebound = http(port, "GET", "/api/state", "evil.example", &[], "");
+    assert!(rebound.starts_with("HTTP/1.1 403"), "{rebound}");
+    let rebound_page = http(port, "GET", "/", &format!("evil.example:{port}"), &[], "");
+    assert!(rebound_page.starts_with("HTTP/1.1 403"), "{rebound_page}");
+    assert!(!rebound_page.contains(&token));
+
+    // None of that touched the task.
+    let state = http_get(port, "/api/state");
+    assert!(state.contains("\"pending\":1"), "{state}");
+    // The real thing still works.
+    let ok = http_post(port, &token, path, "");
+    assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn web_survives_a_corrupt_task_file() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init(home.path());
+    add(home.path(), repo.path(), "w1", "do it");
+    std::fs::write(home.path().join("tasks/broken.md"), "not a task").unwrap();
+
+    let port = 18340u16;
+    let mut child = lf(home.path())
+        .args(["web", "--port", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    http_get(port, "/");
+
+    let state = http_get(port, "/api/state");
+    assert!(state.starts_with("HTTP/1.1 200"), "{state}");
+    assert!(state.contains("\"w1\""));
+    assert!(state.contains("broken.md"), "reported as invalid: {state}");
+    assert!(state.contains("\"invalid\":1"));
 
     child.kill().unwrap();
     child.wait().unwrap();

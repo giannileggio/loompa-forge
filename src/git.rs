@@ -1,18 +1,38 @@
 //! Git and `gh` operations the runner needs, run as argv (no shell).
+//!
+//! Every call has a timeout and no stdin, and git/gh are told never to
+//! prompt, so a stalled network or a credential prompt fails the call
+//! instead of freezing the runner.
 
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::fsutil::run_with_timeout;
 use crate::spec::OnFinish;
 
-fn run(program: &str, dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new(program)
-        .args(args)
+/// Local git commands (status, commit, worktree...).
+const LOCAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Network commands: `git push`, `gh`.
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+fn run(program: &str, dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .current_dir(dir)
-        .output()
-        .with_context(|| format!("running {program} (is it installed?)"))?;
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_EDITOR", "true");
+    let out = run_with_timeout(cmd, timeout).map_err(|e| {
+        // `spawn` failures are io errors; a timeout is a plain message.
+        match e.downcast_ref::<std::io::Error>() {
+            Some(_) => e.context(format!("running {program} (is it installed?)")),
+            None => e.context(format!("`{program} {}`", args.join(" "))),
+        }
+    })?;
     if !out.status.success() {
         bail!(
             "`{program} {}` failed: {}",
@@ -24,7 +44,7 @@ fn run(program: &str, dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    run("git", dir, args)
+    run("git", dir, args, LOCAL_TIMEOUT)
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
@@ -40,14 +60,37 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
     .is_ok()
 }
 
+/// The repo's shared `.git` directory, as an absolute path. The same for a
+/// repo and all of its linked worktrees.
+fn common_dir(dir: &Path) -> Result<std::path::PathBuf> {
+    let out = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let path = Path::new(out.trim());
+    Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
 /// Makes `path` a worktree of `repo` on `branch`, creating the branch from
-/// the repo's HEAD if needed. An existing `path` is reused as is, so a
-/// retried task picks up where the previous attempt left off.
+/// the repo's HEAD if needed. An existing `path` is reused as is (whatever
+/// branch the agent left it on), so a retried task picks up where the
+/// previous attempt left off, but only if it really is a worktree of `repo`.
 pub fn ensure_worktree(repo: &Path, path: &Path, branch: &str) -> Result<()> {
     if path.exists() {
-        return Ok(());
+        let ours = common_dir(path).ok().zip(common_dir(repo).ok());
+        return match ours {
+            Some((a, b)) if a == b => Ok(()),
+            _ => bail!(
+                "{} exists but is not a git worktree of {}; remove it (or its task) and retry",
+                path.display(),
+                repo.display()
+            ),
+        };
     }
     let p = path.to_str().context("worktree path is not valid UTF-8")?;
+    // A worktree directory deleted by hand leaves a stale registration that
+    // would make `worktree add` refuse the same path or branch.
+    git(repo, &["worktree", "prune"])?;
     if branch_exists(repo, branch) {
         git(repo, &["worktree", "add", p, branch])?;
     } else {
@@ -56,8 +99,20 @@ pub fn ensure_worktree(repo: &Path, path: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks out `branch` in `repo` itself, creating it if needed.
+/// Checks out `branch` in `repo` itself, creating it if needed. Refuses to
+/// switch branches over uncommitted changes, which would carry them onto
+/// the task's branch (or fail halfway).
 pub fn checkout_branch(repo: &Path, branch: &str) -> Result<()> {
+    let current = git(repo, &["branch", "--show-current"])?;
+    if current.trim() == branch {
+        return Ok(());
+    }
+    if has_changes(repo)? {
+        bail!(
+            "{} has uncommitted changes: commit or stash them, or run the task in a worktree",
+            repo.display()
+        );
+    }
     if branch_exists(repo, branch) {
         git(repo, &["checkout", branch])?;
     } else {
@@ -133,13 +188,30 @@ pub fn on_finish(action: OnFinish, dir: &Path, id: &str, prompt: &str) -> Result
     if action == OnFinish::Commit {
         return Ok(());
     }
-    git(dir, &["push", "-u", "origin", "HEAD"])?;
+    run(
+        "git",
+        dir,
+        &["push", "-u", "origin", "HEAD"],
+        NETWORK_TIMEOUT,
+    )?;
     if action == OnFinish::Pr {
+        // The push may have worked on an earlier attempt whose `gh` call
+        // then failed: don't open a second PR for the same branch.
+        let existing = run(
+            "gh",
+            dir,
+            &["pr", "view", "--json", "url", "--jq", ".url"],
+            NETWORK_TIMEOUT,
+        );
+        if existing.is_ok() {
+            return Ok(());
+        }
         let (title, body) = message.split_once("\n\n").unwrap_or((&message, ""));
         run(
             "gh",
             dir,
             &["pr", "create", "--title", title, "--body", body],
+            NETWORK_TIMEOUT,
         )?;
     }
     Ok(())
@@ -221,6 +293,63 @@ mod tests {
         assert_eq!(current_branch(repo.path()), "feature");
         checkout_branch(repo.path(), "main").unwrap();
         assert_eq!(current_branch(repo.path()), "main");
+    }
+
+    #[test]
+    fn checkout_refuses_to_carry_uncommitted_changes() {
+        let repo = repo();
+        let p = repo.path();
+        std::fs::write(p.join("wip.txt"), "x").unwrap();
+        let err = checkout_branch(p, "feature").unwrap_err();
+        assert!(err.to_string().contains("uncommitted"), "{err}");
+        assert_eq!(current_branch(p), "main");
+        // Already on the branch: nothing to switch, so nothing to refuse.
+        checkout_branch(p, "main").unwrap();
+    }
+
+    #[test]
+    fn worktree_paths_must_really_be_worktrees_of_the_repo() {
+        let other = repo();
+        let repo = repo();
+        let stray = tempfile::tempdir().unwrap();
+        let err = ensure_worktree(repo.path(), stray.path(), "lf/x").unwrap_err();
+        assert!(err.to_string().contains("not a git worktree"), "{err}");
+
+        // A worktree of some other repo isn't ours either.
+        let foreign = other.path().join("wt");
+        ensure_worktree(other.path(), &foreign, "lf/y").unwrap();
+        assert!(ensure_worktree(repo.path(), &foreign, "lf/y").is_err());
+    }
+
+    #[test]
+    fn a_worktree_deleted_by_hand_can_be_recreated() {
+        let repo = repo();
+        let wt = repo.path().join("wt");
+        ensure_worktree(repo.path(), &wt, "lf/again").unwrap();
+        std::fs::remove_dir_all(&wt).unwrap(); // leaves a stale registration
+        ensure_worktree(repo.path(), &wt, "lf/again").unwrap();
+        assert_eq!(current_branch(&wt), "lf/again");
+    }
+
+    #[test]
+    fn hung_git_commands_time_out() {
+        let repo = repo();
+        let hook = repo.path().join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 30\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(repo.path().join("f.txt"), "x").unwrap();
+        git(repo.path(), &["add", "-A"]).unwrap();
+        let err = run(
+            "git",
+            repo.path(),
+            &["commit", "-m", "slow"],
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
     }
 
     #[test]

@@ -2,7 +2,9 @@ mod clean;
 mod cmd;
 mod config;
 mod control;
+mod doctor;
 mod frontmatter;
+mod fsutil;
 mod git;
 mod home;
 mod run;
@@ -94,8 +96,17 @@ enum Command {
     /// deleted. With --archive, also deletes the archived task file and its
     /// logs, once its worktree is gone.
     Clean(clean::CleanArgs),
-    /// Serve a read-only dashboard over the queue, until interrupted.
+    /// Serve a dashboard over the queue (with actions), until interrupted.
     Web(web::WebArgs),
+    /// Show whether the runner is alive, the queue, budget and failing schedules.
+    Status,
+    /// Check that tasks can run here: tools, config, agents, task files.
+    Doctor,
+    /// Print a systemd or launchd unit that keeps `lf run` running.
+    Service {
+        #[arg(value_enum)]
+        manager: doctor::Manager,
+    },
     /// Launch a task's agent in the current process (used by `lf run`).
     #[command(hide = true)]
     Exec {
@@ -140,6 +151,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Logs { id, attempt } => print!("{}", control::logs(&home, &id, attempt)?),
         Command::Clean(args) => clean::clean(&home, args)?,
         Command::Web(args) => web::serve(&home, args)?,
+        Command::Status => doctor::status(&home)?,
+        Command::Doctor => return doctor::doctor(&home),
+        Command::Service { manager } => doctor::service(&home, manager)?,
         Command::Exec { id, status_file } => return run::exec(&home, &id, &status_file),
     }
     Ok(ExitCode::SUCCESS)

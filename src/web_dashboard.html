@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
+<meta name="lf-token" content="__LF_TOKEN__">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lf web</title>
@@ -150,16 +151,20 @@
     background: var(--failed); color: #fff; font-size: 13px; display: none; z-index: 20;
   }
   .toast.active { display: block; }
+  .warn { margin: 8px 16px; padding: 8px 12px; border: 1px solid var(--failed); border-radius: 6px; font-size: 13px; }
+  .warn[hidden] { display: none; }
 </style>
 </head>
 <body>
 <header>
   <h1><span>&#9670;</span> lf web</h1>
   <span class="home mono" id="home"></span>
+  <span class="updated" id="runner"></span>
   <span class="updated"><span class="dot"></span>as of <span id="updated">-</span></span>
 </header>
 
 <div class="stats" id="stats"></div>
+<div class="warn" id="invalid" hidden></div>
 
 <nav id="tabs">
   <button data-tab="queue" class="active">Queue <span class="count" id="c-queue">0</span></button>
@@ -187,6 +192,7 @@
 <div class="toast" id="toast"></div>
 
 <script>
+const TOKEN = document.querySelector('meta[name="lf-token"]').content;
 const STAT_LABELS = [
   ["pending", "Pending"], ["running", "Running"], ["done", "Done"],
   ["failed", "Failed"], ["cancelled", "Cancelled"], ["needs_review", "Review"],
@@ -267,6 +273,17 @@ async function refresh() {
   document.getElementById("home").textContent = state.home;
   document.getElementById("updated").textContent = state.generated_at;
 
+  const runner = document.getElementById("runner");
+  runner.textContent = state.runner.alive
+    ? `runner: running${state.runner.last_tick ? ` (last pass ${state.runner.last_tick})` : ""}`
+    : "runner: not running (start it with `lf run`)";
+
+  const invalid = document.getElementById("invalid");
+  invalid.hidden = state.invalid.length === 0;
+  invalid.innerHTML = state.invalid.length === 0 ? "" :
+    `<strong>${state.invalid.length} file(s) can't be read:</strong><ul>` +
+    state.invalid.map(i => `<li class="mono">${escapeHtml(i.file)}: ${escapeHtml(i.error)}</li>`).join("") + "</ul>";
+
   document.getElementById("stats").innerHTML = STAT_LABELS.map(([key, label]) =>
     `<div class="stat ${key}"><div class="n">${state.counts[key]}</div><div class="l">${label}</div></div>`
   ).join("");
@@ -329,7 +346,7 @@ async function runAction(id, action) {
   try {
     const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/${action}`, {
       method: "POST",
-      headers: body ? { "Content-Type": "application/json" } : undefined,
+      headers: { "X-LF-Token": TOKEN, ...(body ? { "Content-Type": "application/json" } : {}) },
       body,
     });
     const data = await res.json();

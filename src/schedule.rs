@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::frontmatter;
+use crate::fsutil;
 use crate::spec::{SPEC_KEYS, TaskSpec, validate_id};
+use crate::task::prompt_problems;
 
 /// A recurring task template: `schedules/<id>.md`. The body is the prompt
 /// given to every task it enqueues.
@@ -18,6 +20,10 @@ pub struct Schedule {
     pub cron: String,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Enqueue even if the previous run is still pending or running.
+    /// Off by default: a slow task isn't joined by a pile of copies.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_overlap: bool,
     #[serde(flatten)]
     pub spec: TaskSpec,
 
@@ -29,10 +35,14 @@ pub struct Schedule {
     pub prompt: String,
 }
 
-const SCHEDULE_KEYS: &[&str] = &["id", "cron", "enabled", "last_enqueued_at"];
+const SCHEDULE_KEYS: &[&str] = &["id", "cron", "enabled", "allow_overlap", "last_enqueued_at"];
 
 fn yes() -> bool {
     true
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Schedule {
@@ -51,7 +61,7 @@ impl Schedule {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = frontmatter::render(self, &self.prompt)?;
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+        fsutil::write_atomic(path, text)
     }
 
     pub fn cron(&self) -> Result<Cron> {
@@ -90,9 +100,7 @@ impl Schedule {
         if let Err(e) = self.cron() {
             out.push(e.to_string());
         }
-        if self.prompt.is_empty() {
-            out.push("empty prompt: write the instructions below the frontmatter".into());
-        }
+        out.extend(prompt_problems(&self.prompt));
         out.extend(self.spec.problems(config));
         out
     }

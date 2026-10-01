@@ -106,7 +106,9 @@ Update dependencies to their latest compatible versions...
 
 Then run `{lf} validate {home}/schedules/<id>.md` and fix anything it
 reports. Use an id that doesn't already exist in `{home}/schedules/`. The schedule first
-fires at the next matching time after `lf run` sees it.
+fires at the next matching time after `lf run` sees it. A firing is skipped
+while the previous task from the same schedule is still queued or running;
+add `allow_overlap: true` only if the user wants runs to pile up.
 
 ## 5. Changing or dropping queued work
 
@@ -120,7 +122,8 @@ fires at the next matching time after `lf run` sees it.
   `on_finish`, e.g. opens the PR) and `{lf} fail <id> -r "<why>"`. The
   `error:` field says why a task failed; `{lf} logs <id>` prints its output.
 - Never edit fields lf writes (`status`, `attempts`, `started_at`,
-  `finished_at`, `exit_code`, `tmux_window`, `error`, `last_enqueued_at`),
+  `finished_at`, `exit_code`, `tmux_window`, `error`, `interruptions`,
+  `last_enqueued_at`),
   and never delete task files.
 - Don't edit `running` tasks, or anything in `{home}/archive/`, `logs/` or
   `worktrees/`.

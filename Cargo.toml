@@ -2,6 +2,8 @@
 name = "loompa-forge"
 version = "0.1.0"
 edition = "2024"
+# Let-chains (1.88) and File::lock (1.89) are used; CI checks this version.
+rust-version = "1.89"
 description = "Queue and run coding-agent tasks defined as Markdown files"
 license = "Apache-2.0"
 repository = "https://github.com/giannileggio/loompa-forge"

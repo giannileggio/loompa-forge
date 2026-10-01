@@ -17,6 +17,7 @@ max_parallel = 3            # tasks running at once, overall
 max_parallel_per_repo = 1   # tasks running at once in the same repo
 tmux_session = "loompa"     # one session, one window per task
 poll_interval = "30s"       # how often `lf run` rescans the folders
+# daily_budget_usd = 20.0   # stop starting tasks once today's reported cost reaches this
 
 # Fallbacks for any field a task or schedule doesn't set.
 [defaults]
@@ -96,6 +97,10 @@ pub struct Runner {
     pub tmux_session: String,
     #[serde(with = "humantime_serde")]
     pub poll_interval: Duration,
+    /// Once the cost agents reported for tasks run today reaches this,
+    /// `lf run` starts no more until tomorrow. Unset: no limit. Only agents
+    /// that report a cost (see `cost_usd`) count towards it.
+    pub daily_budget_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -132,6 +137,7 @@ impl Default for Runner {
             max_parallel_per_repo: 1,
             tmux_session: "loompa".into(),
             poll_interval: Duration::from_secs(30),
+            daily_budget_usd: None,
         }
     }
 }
@@ -211,7 +217,7 @@ pub fn installed_presets() -> Vec<&'static str> {
         .collect()
 }
 
-fn on_path(program: &str) -> bool {
+pub fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
@@ -240,6 +246,13 @@ impl Config {
     fn check(&self) -> Result<()> {
         if self.runner.max_parallel == 0 || self.runner.max_parallel_per_repo == 0 {
             bail!("runner.max_parallel and runner.max_parallel_per_repo must be at least 1");
+        }
+        if self
+            .runner
+            .daily_budget_usd
+            .is_some_and(|b| b.is_nan() || b <= 0.0)
+        {
+            bail!("runner.daily_budget_usd must be a positive number");
         }
         for (name, agent) in &self.agents {
             if agent.headless.is_empty() || agent.interactive.is_empty() {
