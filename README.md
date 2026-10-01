@@ -137,3 +137,5 @@ schedule file that can't be parsed shows up in a warning box instead of
 breaking the page.
 
 See [docs/FORMAT.md](docs/FORMAT.md) for the file formats.
+
+See [TODO.md](TODO.md) for open work and ideas.

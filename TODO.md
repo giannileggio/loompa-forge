@@ -5,16 +5,13 @@ so the list stays short.
 
 ## Now
 
-- [ ] Review Dependabot PR #3 (`actions/checkout` 4 → 7). Major bump; confirm CI
-      stays green on `ci.yml` and `release.yml`.
-- [ ] Review Dependabot PR #4 (`actions/cache` 4 → 6). Major bump (ESM
-      migration); confirm the cargo cache key still restores.
+(nothing queued)
 
 ## Next
 
-- [ ] Add a README "Roadmap" line pointing here, so contributors can find it.
 - [ ] Decide whether `lf web` needs optional auth for non-loopback binds
-      (README currently documents "loopback only, no login").
+      (README currently documents "loopback only" plus a Host check and a per-run
+      action token; there is no non-loopback bind option yet).
 
 ## Ideas (unscheduled)
 
