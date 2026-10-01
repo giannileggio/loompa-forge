@@ -12,6 +12,9 @@ use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Local};
@@ -19,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cmd::{md_files, unique_id};
 use crate::config::{Agent, Config};
+use crate::fsutil;
 use crate::git;
 use crate::home::Home;
 use crate::schedule::Schedule;
@@ -26,9 +30,24 @@ use crate::spec::{Effective, Mode};
 use crate::task::{Status, Task, now};
 use crate::tmux;
 
+/// How long a stopped agent gets to exit after SIGTERM before SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+/// Interruptions (see [`Outcome::Interrupted`]) a task absorbs before the
+/// next one counts as a failure, so a task that keeps losing its window
+/// can't loop forever.
+const MAX_INTERRUPTIONS: u32 = 5;
+
 pub fn run(home: &Home, once: bool) -> Result<()> {
     home.ensure_initialized()?;
+    let _runner = home.claim_runner()?;
+    let _ = LOG_FILE.set(home.runner_log());
     let mut config = Config::load(&home.config_path())?;
+    let mut state = RunnerState {
+        pid: std::process::id(),
+        started_at: now(),
+        last_tick_at: None,
+        last_error: None,
+    };
     if !once {
         log(&format!(
             "watching {} every {}",
@@ -37,7 +56,13 @@ pub fn run(home: &Home, once: bool) -> Result<()> {
         ));
     }
     loop {
-        if let Err(e) = tick(home, &config) {
+        let result = tick(home, &config);
+        state.last_tick_at = Some(now());
+        state.last_error = result.as_ref().err().map(|e| format!("{e:#}"));
+        if !once {
+            state.save(home);
+        }
+        if let Err(e) = result {
             if once {
                 return Err(e);
             }
@@ -54,10 +79,40 @@ pub fn run(home: &Home, once: bool) -> Result<()> {
     }
 }
 
+/// The runner's heartbeat, in `runner.json`: lets `lf status` tell a live
+/// runner from a dead or wedged one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerState {
+    pub pid: u32,
+    pub started_at: DateTime<FixedOffset>,
+    pub last_tick_at: Option<DateTime<FixedOffset>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl RunnerState {
+    fn save(&self, home: &Home) {
+        let written = serde_json::to_string(self)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| fsutil::write_atomic(&home.runner_state(), json));
+        if let Err(e) = written {
+            log(&format!("could not write the heartbeat: {e:#}"));
+        }
+    }
+
+    pub fn load(home: &Home) -> Option<Self> {
+        let text = std::fs::read_to_string(home.runner_state()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+}
+
 /// Runs inside the task's tmux window: runs the agent, then writes how it
-/// ended to `status_file` for [`poll_running`] to pick up. If the agent's
-/// (headless-only) stdout is a JSON object reporting `usage`, also writes
-/// token/cost usage next to it, at [`usage_file_for`].
+/// ended to `status_file` for [`poll_running`] to pick up. A headless
+/// agent's stdout and stderr are also streamed to the attempt's log file as
+/// they arrive (see [`StreamedLog`]), so the log survives tmux dying and
+/// isn't limited by its scrollback. If the agent's stdout is a JSON object
+/// reporting `usage`, also writes token/cost usage next to the status, at
+/// [`usage_file_for`].
 pub fn exec(home: &Home, id: &str, status_file: &Path) -> Result<ExitCode> {
     let spawned = (|| {
         let config = Config::load(&home.config_path())?;
@@ -74,11 +129,12 @@ pub fn exec(home: &Home, id: &str, status_file: &Path) -> Result<ExitCode> {
         cmd.args(&argv[1..])
             .env("LF_HOME", home.root())
             .env("LF_TASK_ID", &task.id);
-        // Headless stdout is captured (and teed back below) so a final JSON
-        // summary can be parsed for usage. Interactive mode keeps a real,
-        // fully inherited tty: it's a live session for a human to use.
+        // Headless output is captured (and teed back below) so it can be
+        // logged and a final JSON summary parsed for usage. Interactive
+        // mode keeps a real, fully inherited tty: it's a live session for a
+        // human to use.
         if eff.mode == Mode::Headless {
-            cmd.stdout(Stdio::piped());
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
         let child = cmd
             .spawn()
@@ -95,27 +151,22 @@ pub fn exec(home: &Home, id: &str, status_file: &Path) -> Result<ExitCode> {
                 libc::signal(libc::SIGINT, libc::SIG_IGN);
                 libc::signal(libc::SIGQUIT, libc::SIG_IGN);
             }
-            // Tee piped stdout back to our own (the tmux pane) as it
-            // arrives, so `lf attach`/`lf logs` still see it live, while
-            // also keeping a copy to parse for usage once the agent exits.
-            let stdout_thread = (mode == Mode::Headless).then(|| {
-                let mut stdout = child.stdout.take().expect("piped for headless mode");
-                std::thread::spawn(move || -> Vec<u8> {
-                    let mut out = std::io::stdout();
-                    let mut buf = [0u8; 8192];
-                    let mut captured = Vec::new();
-                    while let Ok(n) = stdout.read(&mut buf)
-                        && n > 0
-                    {
-                        let _ = out.write_all(&buf[..n]);
-                        captured.extend_from_slice(&buf[..n]);
-                    }
-                    let _ = out.flush();
-                    captured
-                })
+            let tees = (mode == Mode::Headless).then(|| {
+                let log = Arc::new(Mutex::new(StreamedLog::create(
+                    &status_file.with_extension("log"),
+                )));
+                let stdout = child.stdout.take().expect("piped for headless mode");
+                let stderr = child.stderr.take().expect("piped for headless mode");
+                (
+                    tee(stdout, std::io::stdout(), log.clone(), true),
+                    tee(stderr, std::io::stderr(), log, false),
+                )
             });
             let status = child.wait().context("waiting for the agent")?;
-            let captured = stdout_thread.and_then(|t| t.join().ok());
+            let captured = tees.and_then(|(out, err)| {
+                let _ = err.join();
+                out.join().ok()
+            });
             let exit = match (status.code(), status.signal()) {
                 (Some(code), _) => Exit::Code(code),
                 (None, Some(sig)) => Exit::Signal(sig),
@@ -133,15 +184,86 @@ pub fn exec(home: &Home, id: &str, status_file: &Path) -> Result<ExitCode> {
     // finds any usage already there.
     if let Some(usage) = usage {
         let path = usage_file_for(status_file);
-        if let Err(e) = std::fs::write(&path, usage.to_json()) {
+        if let Err(e) = fsutil::write_atomic(&path, usage.to_json()) {
             eprintln!("warning: could not write {}: {e:#}", path.display());
         }
     }
-    std::fs::write(status_file, exit.to_string())
-        .with_context(|| format!("writing {}", status_file.display()))?;
+    fsutil::write_atomic(status_file, exit.to_string())?;
     Ok(match exit {
         Exit::Code(c) => ExitCode::from(c.clamp(0, 255) as u8),
         Exit::Signal(_) => ExitCode::FAILURE,
+    })
+}
+
+/// Most of an attempt's output kept in its log file: a runaway agent can't
+/// fill the disk. (The pane still shows everything.)
+const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
+/// Most of the agent's stdout kept in memory to parse for usage.
+const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The file an attempt's output is streamed to: `logs/<id>.<attempt>.log`.
+struct StreamedLog {
+    file: Option<std::fs::File>,
+    written: u64,
+}
+
+impl StreamedLog {
+    /// A log that can't be created is only a warning: the run goes on, and
+    /// the log is captured from the tmux pane at the end instead.
+    fn create(path: &Path) -> Self {
+        let file = std::fs::File::create(path)
+            .map_err(|e| eprintln!("warning: could not write {}: {e}", path.display()))
+            .ok();
+        Self { file, written: 0 }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let Some(file) = &mut self.file else { return };
+        let room = MAX_LOG_BYTES.saturating_sub(self.written) as usize;
+        let n = bytes.len().min(room);
+        let mut ok = file.write_all(&bytes[..n]).is_ok();
+        self.written += n as u64;
+        if n < bytes.len() && ok {
+            ok = file
+                .write_all(b"\n[log truncated: size limit reached]\n")
+                .is_ok();
+            self.written = MAX_LOG_BYTES + 1;
+            self.file = None;
+        }
+        if !ok {
+            self.file = None;
+        }
+    }
+}
+
+/// Copies `src` to `dst` (the pane) and the log as it arrives. With
+/// `capture`, also returns (a bounded amount of) what it read.
+fn tee<R, W>(
+    mut src: R,
+    mut dst: W,
+    log: Arc<Mutex<StreamedLog>>,
+    capture: bool,
+) -> std::thread::JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        let mut captured = Vec::new();
+        while let Ok(n) = src.read(&mut buf)
+            && n > 0
+        {
+            let _ = dst.write_all(&buf[..n]);
+            let _ = dst.flush();
+            if let Ok(mut log) = log.lock() {
+                log.write(&buf[..n]);
+            }
+            if capture && captured.len() < MAX_CAPTURE_BYTES {
+                captured.extend_from_slice(&buf[..n]);
+            }
+        }
+        captured
     })
 }
 
@@ -177,6 +299,10 @@ impl std::str::FromStr for Exit {
 
 fn status_file(home: &Home, id: &str, attempt: u32) -> PathBuf {
     home.logs().join(format!("{id}.{attempt}.exit"))
+}
+
+fn log_file(home: &Home, id: &str, attempt: u32) -> PathBuf {
+    home.logs().join(format!("{id}.{attempt}.log"))
 }
 
 fn usage_file(home: &Home, id: &str, attempt: u32) -> PathBuf {
@@ -244,12 +370,25 @@ fn read_exit(path: &Path) -> Result<Option<Exit>> {
     }
 }
 
+/// One pass. The home lock is held while task files change, but not while
+/// `on_finish` runs (it can talk to the network): successful tasks are
+/// collected under the lock and finalized after it's released.
 fn tick(home: &Home, config: &Config) -> Result<()> {
-    let _lock = home.lock()?;
-    let now = now();
-    enqueue_schedules(home, config, now)?;
-    poll_running(home, config, now)?;
-    start_pending(home, config, now)
+    let succeeded = {
+        let _lock = home.lock()?;
+        let now = now();
+        enqueue_schedules(home, config, now)?;
+        let succeeded = poll_running(home, config, now)?;
+        start_pending(home, config, now)?;
+        succeeded
+    };
+    for (path, task) in succeeded {
+        let id = task.id.clone();
+        if let Err(e) = finalize(home, config, &path, task) {
+            log(&format!("finishing {id}: {e:#}"));
+        }
+    }
+    Ok(())
 }
 
 // --- schedules ---------------------------------------------------------------
@@ -294,12 +433,58 @@ fn enqueue_schedule(
     if !problems.is_empty() {
         anyhow::bail!("not enqueued: {}", problems.join("; "));
     }
+    if !s.allow_overlap && has_queued_run(home, &s.id) {
+        log(&format!(
+            "schedule {}: skipped {}: the previous run is still queued or running \
+             (set `allow_overlap: true` to enqueue anyway)",
+            s.id,
+            slot.format("%Y-%m-%d %H:%M")
+        ));
+        return Ok(());
+    }
+    let streak = failure_streak(home, &s.id);
+    if streak >= FAILURE_WARNING_STREAK {
+        log(&format!(
+            "warning: schedule {}: its last {streak} runs all failed",
+            s.id
+        ));
+    }
     let base = format!("{}-{}", truncate_id(&s.id, 48), slot.format("%Y%m%d-%H%M"));
     let mut task = Task::new(unique_id(home, &base), s.spec.clone(), s.prompt.clone());
     task.created_by = Some(format!("schedule:{}", s.id));
     task.create(&home.tasks().join(format!("{}.md", task.id)))?;
     log(&format!("enqueued {} from schedule {}", task.id, s.id));
     Ok(())
+}
+
+/// Consecutive failed runs of a schedule at which the runner starts warning.
+const FAILURE_WARNING_STREAK: usize = 3;
+
+fn created_by_schedule(task: &Task, schedule_id: &str) -> bool {
+    task.created_by.as_deref() == Some(&format!("schedule:{schedule_id}"))
+}
+
+/// Whether a task from this schedule is still in `tasks/` (pending or running).
+fn has_queued_run(home: &Home, schedule_id: &str) -> bool {
+    md_files(&home.tasks())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| Task::load(p).ok())
+        .any(|t| created_by_schedule(&t, schedule_id))
+}
+
+/// How many of the schedule's most recent finished runs failed in a row.
+pub fn failure_streak(home: &Home, schedule_id: &str) -> usize {
+    let mut runs: Vec<Task> = md_files(&home.archive())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| Task::load(p).ok())
+        .filter(|t| created_by_schedule(t, schedule_id))
+        .collect();
+    runs.sort_by_key(|t| std::cmp::Reverse(t.finished_at));
+    runs.iter()
+        .take_while(|t| t.status == Status::Failed)
+        .count()
 }
 
 fn truncate_id(id: &str, max: usize) -> &str {
@@ -316,10 +501,20 @@ enum Outcome {
     },
     /// An interactive session ended without `lf done` / `lf fail`.
     NeedsReview,
+    /// The attempt was cut short from outside (its tmux window vanished or
+    /// was killed, e.g. by a reboot): requeued without using up a retry.
+    Interrupted(String),
 }
 
-fn poll_running(home: &Home, config: &Config, now: DateTime<FixedOffset>) -> Result<()> {
+/// Reaps finished tasks. Returns the successful ones, whose `on_finish` is
+/// still to run (see [`tick`]).
+fn poll_running(
+    home: &Home,
+    config: &Config,
+    now: DateTime<FixedOffset>,
+) -> Result<Vec<(PathBuf, Task)>> {
     let mut panes: HashMap<String, Vec<tmux::Pane>> = HashMap::new();
+    let mut succeeded = Vec::new();
     for (path, mut task) in load_tasks(home, Status::Running)? {
         let (session, window) = window_of(&task, config);
         if !panes.contains_key(&session) {
@@ -331,23 +526,19 @@ fn poll_running(home: &Home, config: &Config, now: DateTime<FixedOffset>) -> Res
         if exit.is_some()
             && let Some(usage) = read_usage(&usage_file(home, &task.id, task.attempts))
         {
-            task.tokens_in = usage.tokens_in;
-            task.tokens_out = usage.tokens_out;
-            task.cost_usd = usage.cost_usd;
+            task.add_usage(usage.tokens_in, usage.tokens_out, usage.cost_usd);
         }
+        let mut stop_agent = false;
         let outcome = match (exit, pane) {
             (Some(exit), _) => exit_outcome(eff.mode, exit),
-            (None, None) => Outcome::Failed {
-                error: "tmux window disappeared".into(),
-                exit_code: None,
-            },
+            (None, None) => Outcome::Interrupted("tmux window disappeared".into()),
             // `lf exec` writes the status before exiting, so a dead pane
             // without one means `lf exec` itself was killed.
-            (None, Some(p)) if p.dead => Outcome::Failed {
-                error: "the agent's window was killed".into(),
-                exit_code: None,
-            },
+            (None, Some(p)) if p.dead => {
+                Outcome::Interrupted("the agent's window was killed".into())
+            }
             (None, Some(_)) if eff.mode == Mode::Headless && timed_out(&task, &eff, now) => {
+                stop_agent = true;
                 Outcome::Failed {
                     error: format!(
                         "timed out after {}",
@@ -359,14 +550,25 @@ fn poll_running(home: &Home, config: &Config, now: DateTime<FixedOffset>) -> Res
             (None, Some(_)) => continue,
         };
         if pane.is_some() {
+            if stop_agent {
+                tmux::stop_processes(&session, &window, STOP_GRACE);
+            }
             save_log(home, &task, &session, &window);
             tmux::kill_window(&session, &window)?;
         }
-        if let Err(e) = finish(home, config, &path, task, outcome, now) {
-            log(&format!("finishing {}: {e:#}", path.display()));
+        match outcome {
+            Outcome::Succeeded(code) => {
+                task.exit_code = Some(code);
+                succeeded.push((path, task));
+            }
+            outcome => {
+                if let Err(e) = finish(home, config, &path, task, outcome, now) {
+                    log(&format!("finishing {}: {e:#}", path.display()));
+                }
+            }
         }
     }
-    Ok(())
+    Ok(succeeded)
 }
 
 fn exit_outcome(mode: Mode, exit: Exit) -> Outcome {
@@ -399,17 +601,21 @@ pub fn window_of(task: &Task, config: &Config) -> (String, String) {
     }
 }
 
+/// Saves the attempt's output: the pane's scrollback, unless `lf exec`
+/// already streamed the full output to the log file (headless runs).
 pub fn save_log(home: &Home, task: &Task, session: &str, window: &str) {
-    let path = home
-        .logs()
-        .join(format!("{}.{}.log", task.id, task.attempts));
-    let result = tmux::capture(session, window)
-        .and_then(|text| std::fs::write(&path, text).map_err(Into::into));
+    let path = log_file(home, &task.id, task.attempts);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+        return;
+    }
+    let result = tmux::capture(session, window).and_then(|text| fsutil::write_atomic(&path, text));
     if let Err(e) = result {
         log(&format!("{}: could not save the log: {e:#}", task.id));
     }
 }
 
+/// Applies an outcome other than success, which [`poll_running`] hands to
+/// [`finalize`] instead.
 fn finish(
     home: &Home,
     config: &Config,
@@ -420,13 +626,26 @@ fn finish(
 ) -> Result<()> {
     let eff = task.spec.resolve(&config.defaults);
     match outcome {
-        Outcome::Succeeded(code) => {
-            task.exit_code = Some(code);
-            complete(home, config, path, task, now).map(drop)
-        }
+        Outcome::Succeeded(_) => unreachable!("successes go through finalize"),
         Outcome::NeedsReview => {
             task.status = Status::NeedsReview;
             archive(home, path, task, now)
+        }
+        Outcome::Interrupted(reason) if task.interruptions < MAX_INTERRUPTIONS => {
+            task.interruptions += 1;
+            task.status = Status::Pending;
+            task.scheduled_at = None;
+            task.tmux_window = None;
+            task.error = None;
+            log(&format!(
+                "{} was interrupted (attempt {}): {reason}; requeueing without using a retry",
+                task.id, task.attempts
+            ));
+            task.save(path)
+        }
+        Outcome::Interrupted(reason) => {
+            let error = format!("{reason} (interrupted {MAX_INTERRUPTIONS} times)");
+            fail_attempt(home, path, task, &eff, error, now)
         }
         Outcome::Failed { error, exit_code } => {
             task.exit_code = exit_code;
@@ -435,8 +654,31 @@ fn finish(
     }
 }
 
+/// Runs `on_finish` for a task that succeeded, then archives it as done (or
+/// as failed if `on_finish` fails). Called without the home lock, so a slow
+/// push can't block other commands; the lock is taken only to archive, and
+/// only if the task is still as it was (not cancelled or finished by hand
+/// meanwhile).
+fn finalize(home: &Home, config: &Config, path: &Path, mut task: Task) -> Result<()> {
+    let result = run_on_finish(home, config, &task);
+    let _lock = home.lock()?;
+    match Task::load(path) {
+        Ok(current) if current.status == task.status && current.attempts == task.attempts => {}
+        _ => {
+            log(&format!(
+                "{} changed while on_finish ran; leaving it as it is",
+                task.id
+            ));
+            return Ok(());
+        }
+    }
+    record_finish(&mut task, result);
+    archive(home, path, task, now())
+}
+
 /// Runs `on_finish` and archives the task as done, or as failed if
-/// `on_finish` fails. Returns the final status.
+/// `on_finish` fails. Returns the final status. The caller holds the home
+/// lock throughout (see [`finalize`] for the runner's lock-free variant).
 pub fn complete(
     home: &Home,
     config: &Config,
@@ -444,9 +686,21 @@ pub fn complete(
     mut task: Task,
     now: DateTime<FixedOffset>,
 ) -> Result<Status> {
+    let result = run_on_finish(home, config, &task);
+    record_finish(&mut task, result);
+    let status = task.status;
+    archive(home, path, task, now)?;
+    Ok(status)
+}
+
+fn run_on_finish(home: &Home, config: &Config, task: &Task) -> Result<()> {
     let eff = task.spec.resolve(&config.defaults);
-    let dir = workdir(home, &task, &eff);
-    match git::on_finish(eff.on_finish, &dir, &task.id, &task.prompt) {
+    let dir = workdir(home, task, &eff);
+    git::on_finish(eff.on_finish, &dir, &task.id, &task.prompt)
+}
+
+fn record_finish(task: &mut Task, on_finish: Result<()>) {
+    match on_finish {
         Ok(()) => {
             task.status = Status::Done;
             task.error = None;
@@ -456,9 +710,6 @@ pub fn complete(
             task.error = Some(format!("on_finish failed: {e:#}"));
         }
     }
-    let status = task.status;
-    archive(home, path, task, now)?;
-    Ok(status)
 }
 
 /// Requeues the task after `retry_delay` if it has retries left, otherwise
@@ -473,7 +724,10 @@ fn fail_attempt(
 ) -> Result<()> {
     task.error = Some(error);
     task.tmux_window = None;
-    if retry_left(task.attempts, eff.retries) {
+    if retry_left(
+        task.attempts.saturating_sub(task.interruptions),
+        eff.retries,
+    ) {
         task.status = Status::Pending;
         task.scheduled_at = Some(now + eff.retry_delay);
         log(&format!(
@@ -514,7 +768,51 @@ pub fn archive(home: &Home, path: &Path, mut task: Task, now: DateTime<FixedOffs
 
 // --- starting tasks ------------------------------------------------------------
 
+/// Cost agents reported for tasks run today (local time): finished ones in
+/// `archive/` and the ones still queued or running in `tasks/`.
+fn spent_today(home: &Home, now: DateTime<FixedOffset>) -> f64 {
+    let midnight = now
+        .with_timezone(&Local)
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|t| t.and_local_timezone(Local).earliest())
+        .map(|t| t.fixed_offset());
+    let today = |t: &Task| match (midnight, t.finished_at.or(t.started_at)) {
+        (Some(m), Some(at)) => at >= m,
+        _ => false,
+    };
+    [home.tasks(), home.archive()]
+        .iter()
+        .flat_map(|dir| md_files(dir).unwrap_or_default())
+        .filter_map(|p| Task::load(&p).ok())
+        .filter(today)
+        .filter_map(|t| t.cost_usd)
+        .sum()
+}
+
+static BUDGET_NOTIFIED: AtomicBool = AtomicBool::new(false);
+
+/// Whether `runner.daily_budget_usd` is used up. Logs once per day-crossing.
+fn over_budget(home: &Home, config: &Config, now: DateTime<FixedOffset>) -> bool {
+    let Some(budget) = config.runner.daily_budget_usd else {
+        return false;
+    };
+    let spent = spent_today(home, now);
+    let over = spent >= budget;
+    if over && !BUDGET_NOTIFIED.swap(true, Ordering::Relaxed) {
+        log(&format!(
+            "daily budget reached (${spent:.2} of ${budget:.2}): not starting new tasks until tomorrow"
+        ));
+    } else if !over {
+        BUDGET_NOTIFIED.store(false, Ordering::Relaxed);
+    }
+    over
+}
+
 fn start_pending(home: &Home, config: &Config, now: DateTime<FixedOffset>) -> Result<()> {
+    if over_budget(home, config, now) {
+        return Ok(());
+    }
     let mut per_repo: HashMap<PathBuf, usize> = HashMap::new();
     let running = load_tasks(home, Status::Running)?;
     for (_, t) in &running {
@@ -578,6 +876,7 @@ fn start(
         // attempt as soon as it's polled.
         let status = status_file(home, &task.id, task.attempts);
         remove_if_exists(&status)?;
+        remove_if_exists(&log_file(home, &task.id, task.attempts))?;
         tmux::spawn(
             session,
             &task.id,
@@ -698,8 +997,30 @@ fn load_tasks(home: &Home, status: Status) -> Result<Vec<(PathBuf, Task)>> {
     Ok(out)
 }
 
+/// Where [`log`] also appends, once `lf run` has set it.
+static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+/// The log file is moved to `.1` (replacing an older one) beyond this size.
+const MAX_RUNNER_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
 pub fn log(msg: &str) {
-    println!("{} {msg}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+    let line = format!("{} {msg}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+    println!("{line}");
+    if let Some(path) = LOG_FILE.get() {
+        append_log_line(path, &line);
+    }
+}
+
+fn append_log_line(path: &Path, line: &str) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_RUNNER_LOG_BYTES) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 #[cfg(test)]

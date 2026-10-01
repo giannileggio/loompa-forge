@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::frontmatter;
+use crate::fsutil;
 use crate::spec::{SPEC_KEYS, TaskSpec, validate_id};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +55,10 @@ pub struct Task {
     // Written by loompa-forge only.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub attempts: u32,
+    /// Attempts cut short by something other than the task itself (tmux or
+    /// the machine going away). They don't count against `retries`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub interruptions: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<FixedOffset>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +90,7 @@ const TASK_KEYS: &[&str] = &[
     "created_at",
     "created_by",
     "attempts",
+    "interruptions",
     "started_at",
     "finished_at",
     "exit_code",
@@ -141,6 +147,7 @@ impl Task {
             created_at: Some(now()),
             created_by: None,
             attempts: 0,
+            interruptions: 0,
             started_at: None,
             finished_at: None,
             exit_code: None,
@@ -151,6 +158,27 @@ impl Task {
             cost_usd: None,
             prompt,
         }
+    }
+
+    /// Adds one attempt's reported usage to the task's totals.
+    pub fn add_usage(
+        &mut self,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        cost: Option<f64>,
+    ) {
+        fn sum<T: std::ops::Add<Output = T> + Default + Copy>(
+            a: Option<T>,
+            b: Option<T>,
+        ) -> Option<T> {
+            match (a, b) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or_default() + b.unwrap_or_default()),
+            }
+        }
+        self.tokens_in = sum(self.tokens_in, tokens_in);
+        self.tokens_out = sum(self.tokens_out, tokens_out);
+        self.cost_usd = sum(self.cost_usd, cost);
     }
 
     pub fn parse(content: &str) -> Result<Self> {
@@ -172,19 +200,12 @@ impl Task {
 
     /// Writes the task, failing if the file already exists.
     pub fn create(&self, path: &Path) -> Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        file.write_all(self.to_markdown()?.as_bytes())?;
-        Ok(())
+        fsutil::create_atomic(path, self.to_markdown()?)
     }
 
+    /// Replaces the file in one step, so a crash can't leave it truncated.
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, self.to_markdown()?)
-            .with_context(|| format!("writing {}", path.display()))
+        fsutil::write_atomic(path, self.to_markdown()?)
     }
 
     /// Branch the task runs on: explicit, or `lf/<id>` when using a worktree.
@@ -209,11 +230,28 @@ impl Task {
                 self.id
             ));
         }
-        if self.prompt.is_empty() {
-            out.push("empty prompt: write the instructions below the frontmatter".into());
-        }
+        out.extend(prompt_problems(&self.prompt));
         out.extend(self.spec.problems(config));
         out
+    }
+}
+
+/// The prompt is passed to the agent as one command-line argument, which
+/// Linux caps at 128 KiB (and fails to exec beyond that).
+pub const MAX_PROMPT_BYTES: usize = 100_000;
+
+/// Problems with a task or schedule prompt.
+pub fn prompt_problems(prompt: &str) -> Option<String> {
+    if prompt.is_empty() {
+        Some("empty prompt: write the instructions below the frontmatter".into())
+    } else if prompt.len() > MAX_PROMPT_BYTES {
+        Some(format!(
+            "prompt is {} bytes, over the {MAX_PROMPT_BYTES} an agent can be given as an argument: \
+             put the details in a file in the repo and point the prompt at it",
+            prompt.len()
+        ))
+    } else {
+        None
     }
 }
 
@@ -290,6 +328,26 @@ Fix the redirect loop.
             fmt_tokens(Some(1500), Some(2_340_000)),
             "1.5k in / 2.3M out"
         );
+    }
+
+    #[test]
+    fn usage_adds_up_across_attempts() {
+        let mut t = Task::parse(SAMPLE).unwrap();
+        t.add_usage(None, None, None);
+        assert_eq!((t.tokens_in, t.cost_usd), (None, None));
+        t.add_usage(Some(100), Some(10), Some(0.5));
+        t.add_usage(Some(50), None, Some(0.25));
+        assert_eq!(t.tokens_in, Some(150));
+        assert_eq!(t.tokens_out, Some(10));
+        assert_eq!(t.cost_usd, Some(0.75));
+    }
+
+    #[test]
+    fn oversized_prompts_are_a_problem() {
+        let mut t = Task::parse(SAMPLE).unwrap();
+        t.prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let problems = t.problems(&Config::default(), None);
+        assert!(problems.iter().any(|p| p.contains("bytes")), "{problems:?}");
     }
 
     #[test]

@@ -38,8 +38,7 @@ pub fn init(home: &Home, args: InitArgs) -> Result<()> {
         println!("kept existing {}", config.display());
     } else {
         let agent = choose_agent(args.agent)?;
-        std::fs::write(&config, default_config_toml(agent.as_deref()))
-            .with_context(|| format!("writing {}", config.display()))?;
+        crate::fsutil::write_atomic(&config, default_config_toml(agent.as_deref()))?;
         println!("wrote {}", config.display());
     }
     skill::install_in_home(home)?;

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::Config;
 use crate::home::Home;
 use crate::run;
+use crate::spec::validate_id;
 use crate::task::{Status, Task, now};
 use crate::tmux;
 
@@ -161,6 +162,7 @@ fn setup(home: &Home, id: Option<String>) -> Result<(Config, String)> {
 
 /// The task's file, in `tasks/` or else `archive/`.
 fn find(home: &Home, id: &str) -> Result<(PathBuf, Task)> {
+    validate_id(id).map_err(anyhow::Error::msg)?;
     for dir in [home.tasks(), home.archive()] {
         let path = dir.join(format!("{id}.md"));
         if path.exists() {
@@ -171,9 +173,12 @@ fn find(home: &Home, id: &str) -> Result<(PathBuf, Task)> {
     bail!("no task `{id}` in tasks/ or archive/")
 }
 
+/// How long a stopped agent gets to exit after SIGTERM before SIGKILL.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 type Window = (String, String);
 
-/// Saves a running task's output and kills its window, so the agent stops
+/// Saves a running task's output and stops its agent and window, so the agent stops
 /// before `on_finish` touches its work. From inside that window, killing it
 /// would kill this command too, so the kill is returned for after the task
 /// is archived.
@@ -183,7 +188,7 @@ fn end_session(home: &Home, config: &Config, task: &Task) -> Result<Option<Windo
     if std::env::var("LF_TASK_ID").is_ok_and(|v| v == task.id) {
         return Ok(Some((session, window)));
     }
-    tmux::kill_window(&session, &window)?;
+    tmux::terminate_window(&session, &window, STOP_GRACE)?;
     Ok(None)
 }
 

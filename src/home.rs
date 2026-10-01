@@ -1,6 +1,12 @@
+use std::fs::TryLockError;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
+/// How long a command waits for another `lf` process to release the lock
+/// before giving up, instead of hanging behind a stuck one.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The single folder holding everything loompa-forge owns.
 ///
@@ -67,15 +73,70 @@ impl Home {
         ]
     }
 
-    /// Blocks until no other `lf` process is changing task files, and holds
-    /// that lock until the returned file is dropped.
+    /// Where `lf run` appends its log (rotated when it grows large).
+    pub fn runner_log(&self) -> PathBuf {
+        self.root.join("runner.log")
+    }
+
+    /// Heartbeat written by `lf run` every pass: pid, start and last tick.
+    pub fn runner_state(&self) -> PathBuf {
+        self.root.join("runner.json")
+    }
+
+    /// Waits until no other `lf` process is changing task files, and holds
+    /// that lock until the returned file is dropped. Gives up after two
+    /// minutes with an error, so a stuck process can't hang everything else.
     pub fn lock(&self) -> Result<std::fs::File> {
         let path = self.root.join(".lock");
         let file =
             std::fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("locking {}", path.display()))?;
-        Ok(file)
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(TryLockError::WouldBlock) => bail!(
+                    "{} is locked by another lf process for over {}; if nothing is running, \
+                     it may be stuck (see `lf status`)",
+                    path.display(),
+                    humantime::format_duration(LOCK_TIMEOUT)
+                ),
+                Err(TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("locking {}", path.display()));
+                }
+            }
+        }
+    }
+
+    /// Claims the right to be *the* `lf run` for this home, until the
+    /// returned file is dropped (or the process dies). Fails if another
+    /// runner holds it.
+    pub fn claim_runner(&self) -> Result<std::fs::File> {
+        let path = self.root.join(".runner.lock");
+        let file =
+            std::fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => {
+                bail!(
+                    "another `lf run` is already running for {}",
+                    self.root.display()
+                )
+            }
+            Err(TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+
+    /// Whether some process currently holds [`claim_runner`](Self::claim_runner).
+    pub fn runner_alive(&self) -> bool {
+        let Ok(file) = std::fs::File::open(self.root.join(".runner.lock")) else {
+            return false;
+        };
+        matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock))
     }
 
     /// Fails with a helpful message if `lf init` has not been run.
