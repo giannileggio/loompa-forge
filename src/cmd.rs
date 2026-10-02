@@ -218,6 +218,9 @@ pub fn ls(home: &Home, archive: bool, schedules: bool, watch: Option<Duration>) 
     let Some(interval) = watch else {
         return ls_once(home, archive, schedules);
     };
+    if !schedules && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return crate::watch::run(home, archive, interval);
+    }
     loop {
         print!("\x1B[2J\x1B[H"); // clear screen, cursor to top-left
         println!(
@@ -243,19 +246,39 @@ fn ls_once(home: &Home, archive: bool, schedules: bool) -> Result<()> {
     } else {
         home.tasks()
     };
+    let (tasks, warnings) = load_tasks(&dir)?;
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+    let rows = task_rows(&config, &tasks);
+    print_table(&rows);
+    if tasks.is_empty() && !archive && std::io::stdout().is_terminal() {
+        println!("\nNothing queued yet. Add something with: lf add \"describe the work\"");
+    }
+    Ok(())
+}
+
+/// The tasks in `dir`, oldest first, plus a warning for each file that
+/// couldn't be read.
+pub fn load_tasks(dir: &Path) -> Result<(Vec<Task>, Vec<String>)> {
     let mut tasks = Vec::new();
-    for path in md_files(&dir)? {
+    let mut warnings = Vec::new();
+    for path in md_files(dir)? {
         match Task::load(&path) {
             Ok(t) => tasks.push(t),
-            Err(e) => eprintln!("warning: skipping {}: {e:#}", path.display()),
+            Err(e) => warnings.push(format!("skipping {}: {e:#}", path.display())),
         }
     }
     tasks.sort_by_key(|t| (t.scheduled_at.or(t.created_at), t.id.clone()));
+    Ok((tasks, warnings))
+}
 
+/// The header row plus one row per task, as `lf ls` shows them.
+pub fn task_rows(config: &Config, tasks: &[Task]) -> Vec<Vec<String>> {
     let mut rows = vec![row([
         "ID", "STATUS", "WHEN", "REPO", "BRANCH", "AGENT", "TOKENS", "COST",
     ])];
-    for t in &tasks {
+    for t in tasks {
         let eff = t.spec.resolve(&config.defaults);
         let when = match (t.finished_at, t.started_at, t.scheduled_at) {
             (Some(at), _, _) | (None, Some(at), _) | (None, None, Some(at)) => fmt_time(at),
@@ -266,7 +289,7 @@ fn ls_once(home: &Home, archive: bool, schedules: bool) -> Result<()> {
             t.status.as_str().into(),
             when,
             contract_tilde(&eff.repo),
-            t.effective_branch(&config).unwrap_or_else(|| "-".into()),
+            t.effective_branch(config).unwrap_or_else(|| "-".into()),
             match (eff.agent, eff.model) {
                 (Some(a), Some(m)) => format!("{a}/{m}"),
                 (Some(a), None) => a,
@@ -276,11 +299,7 @@ fn ls_once(home: &Home, archive: bool, schedules: bool) -> Result<()> {
             fmt_cost(t.cost_usd),
         ]);
     }
-    print_table(&rows);
-    if tasks.is_empty() && !archive && std::io::stdout().is_terminal() {
-        println!("\nNothing queued yet. Add something with: lf add \"describe the work\"");
-    }
-    Ok(())
+    rows
 }
 
 fn ls_schedules(home: &Home, config: &Config) -> Result<()> {
@@ -594,21 +613,30 @@ fn row<const N: usize>(cells: [&str; N]) -> Vec<String> {
     cells.iter().map(|s| s.to_string()).collect()
 }
 
+/// Aligned table lines, header first, trailing spaces trimmed.
+pub fn table_lines(rows: &[Vec<String>]) -> Vec<String> {
+    let cols = rows[0].len();
+    let widths: Vec<usize> = (0..cols)
+        .map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
+        .collect();
+    rows.iter()
+        .map(|r| {
+            let line: Vec<String> = r
+                .iter()
+                .zip(&widths)
+                .map(|(cell, w)| format!("{cell:<w$}"))
+                .collect();
+            line.join("  ").trim_end().to_string()
+        })
+        .collect()
+}
+
 fn print_table(rows: &[Vec<String>]) {
     if rows.len() == 1 {
         println!("(none)");
         return;
     }
-    let cols = rows[0].len();
-    let widths: Vec<usize> = (0..cols)
-        .map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
-        .collect();
-    for r in rows {
-        let line: Vec<String> = r
-            .iter()
-            .zip(&widths)
-            .map(|(cell, w)| format!("{cell:<w$}"))
-            .collect();
-        println!("{}", line.join("  ").trim_end());
+    for line in table_lines(rows) {
+        println!("{line}");
     }
 }

@@ -89,7 +89,9 @@ lf agents use codex  # make one the default for new tasks
 lf ls                # queue
 lf ls --schedules    # schedules with their next run
 lf ls --archive      # finished tasks
-lf ls --watch        # ...refreshed every --interval (default 2s) until Ctrl-C
+lf ls --watch        # ...live, every --interval (default 2s); in a terminal it's
+                     # interactive: j/k move, l logs, d/f/c done/fail/cancel (asks
+                     # first), r retry, a attach, tab queue/archive, q quit
 lf validate          # check every task and schedule file
 
 lf run               # run the queue until Ctrl-C (rescans every poll_interval)

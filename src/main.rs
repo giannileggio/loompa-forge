@@ -15,6 +15,7 @@ mod spec;
 mod task;
 mod tmux;
 mod update_check;
+mod watch;
 mod web;
 
 use std::path::PathBuf;
