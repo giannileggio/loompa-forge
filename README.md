@@ -89,7 +89,9 @@ lf agents use codex  # make one the default for new tasks
 lf ls                # queue
 lf ls --schedules    # schedules with their next run
 lf ls --archive      # finished tasks
-lf ls --watch        # ...refreshed every --interval (default 2s) until Ctrl-C
+lf ls --watch        # ...live, every --interval (default 2s); in a terminal it's
+                     # interactive: j/k move, l logs, d/f/c done/fail/cancel (asks
+                     # first), r retry, a attach, tab queue/archive, q quit
 lf validate          # check every task and schedule file
 
 lf run               # run the queue until Ctrl-C (rescans every poll_interval)
@@ -190,3 +192,19 @@ breaking the page.
 See [docs/FORMAT.md](docs/FORMAT.md) for the file formats.
 
 See [TODO.md](TODO.md) for open work and ideas.
+
+## Testing
+
+```sh
+cargo test                  # unit tests, plus the CLI and runner tests in tests/
+                            # (they run the built `lf` against real git and tmux)
+
+cargo build                 # browser tests for the dashboard, in e2e/
+cd e2e && npm ci && npx playwright install chromium
+npm test                    # LF_BIN=path/to/lf to test another build
+```
+
+The browser tests start `lf start`/`lf web` for each test against a throwaway
+home, git repo and tmux server, with a stub agent that runs the prompt as a
+shell command, so they need `tmux` and `git` but no real coding agent and touch
+none of your files. CI runs both on every push and pull request.

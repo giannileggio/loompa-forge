@@ -49,6 +49,53 @@ jobs:
       - name: Test
         run: cargo test --all
 
+  # Drives the dashboard in a real browser against the built `lf`, with a stub
+  # agent (see e2e/). The Rust tests cover the CLI, runner and HTTP API; this
+  # covers the page itself.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        run: rustup update stable && rustup default stable
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: e2e-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build lf
+        run: cargo build
+
+      - name: Install test dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install the browser
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the browser tests
+        working-directory: e2e
+        run: npm test
+
+      - name: Keep the report when tests fail
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+          retention-days: 7
+
   # The oldest Rust the code is written for (`rust-version` in Cargo.toml).
   msrv:
     runs-on: ubuntu-latest
