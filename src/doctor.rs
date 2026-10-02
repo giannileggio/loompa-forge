@@ -48,7 +48,9 @@ pub fn status(home: &Home) -> Result<()> {
             println!("           last pass failed: {err}");
         }
     } else {
-        println!("runner     NOT running: start it with `lf run` (`lf service` keeps it up)");
+        println!(
+            "runner     NOT running: start it with `lf start` (or `lf run`; `lf service` keeps it up)"
+        );
     }
 
     let load = |dir: std::path::PathBuf| -> Vec<Task> {
@@ -111,15 +113,49 @@ pub fn status(home: &Home) -> Result<()> {
     Ok(())
 }
 
-enum Check {
+pub enum Check {
     Ok(String),
     Warn(String),
     Fail(String),
 }
 
+impl Check {
+    /// `ok`, `warn` or `fail`.
+    pub fn level(&self) -> &'static str {
+        match self {
+            Check::Ok(_) => "ok",
+            Check::Warn(_) => "warn",
+            Check::Fail(_) => "fail",
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Check::Ok(m) | Check::Warn(m) | Check::Fail(m) => m,
+        }
+    }
+}
+
 /// Checks that tasks can actually run here. Exits non-zero if anything is
 /// wrong enough to stop them.
 pub fn doctor(home: &Home) -> Result<ExitCode> {
+    let mut checks = checks(home);
+    checks.push(runner_check(home));
+    report(checks)
+}
+
+fn runner_check(home: &Home) -> Check {
+    if home.runner_alive() {
+        Check::Ok("a runner is running".into())
+    } else {
+        Check::Warn("no runner is running: start it with `lf start` (or `lf run`)".into())
+    }
+}
+
+/// Everything `lf doctor` checks except whether a runner is up (see
+/// [`runner_check`]): the tools, config, agents and task files. The
+/// dashboard shows these as its setup check.
+pub fn checks(home: &Home) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut add = |c: Check| checks.push(c);
 
@@ -138,7 +174,7 @@ pub fn doctor(home: &Home) -> Result<ExitCode> {
             "{} is not initialized: run `lf init`",
             home.root().display()
         )));
-        return report(checks);
+        return checks;
     }
     let probe = home.root().join(".doctor-probe");
     match std::fs::write(&probe, b"") {
@@ -159,14 +195,19 @@ pub fn doctor(home: &Home) -> Result<ExitCode> {
         }
         Err(e) => {
             add(Check::Fail(format!("{e:#}")));
-            return report(checks);
+            return checks;
         }
     };
 
     // Files that don't parse or can't run.
     let mut broken = 0;
-    let mut files = md_files(&home.tasks())?;
-    files.extend(md_files(&home.schedules())?);
+    let mut files = Vec::new();
+    for dir in [home.tasks(), home.schedules()] {
+        match md_files(&dir) {
+            Ok(found) => files.extend(found),
+            Err(e) => add(Check::Warn(format!("{e:#}"))),
+        }
+    }
     let mut agents_used = std::collections::BTreeSet::new();
     let mut wants_pr = false;
     let mut stale_running = Vec::new();
@@ -209,6 +250,13 @@ pub fn doctor(home: &Home) -> Result<ExitCode> {
         )));
     }
 
+    if config.defaults.agent.is_none() {
+        add(Check::Warn(
+            "no default agent is set: add `agent = \"claude\"` (or another) under [defaults] \
+             in config.toml, or tasks must name one"
+                .into(),
+        ));
+    }
     agents_used.extend(config.defaults.agent.clone());
     for name in &agents_used {
         let program = config.agents.get(name).and_then(|a| a.headless.first());
@@ -248,12 +296,7 @@ pub fn doctor(home: &Home) -> Result<ExitCode> {
         }
     }
 
-    if home.runner_alive() {
-        add(Check::Ok("a runner is running".into()));
-    } else {
-        add(Check::Warn("no runner is running: start `lf run`".into()));
-    }
-    report(checks)
+    checks
 }
 
 fn report(checks: Vec<Check>) -> Result<ExitCode> {

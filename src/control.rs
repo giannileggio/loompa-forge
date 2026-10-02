@@ -4,7 +4,10 @@
 //! a `tick` of `lf run`. The id defaults to `$LF_TASK_ID`, which `lf run`
 //! sets in each task's window, so `lf done` works from inside a session.
 
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -14,6 +17,105 @@ use crate::run;
 use crate::spec::validate_id;
 use crate::task::{Status, Task, now};
 use crate::tmux;
+
+/// How long `lf stop` waits for the runner to exit, and `start_runner` for
+/// one to come up, before giving up.
+const RUNNER_WAIT: Duration = Duration::from_secs(10);
+
+fn wait_for(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + deadline;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Starts `lf run` in the background, detached from this process and its
+/// terminal, so it keeps going after the dashboard or shell that started it
+/// is closed. Returns `false` if a runner was already running.
+pub fn start_runner(home: &Home) -> Result<bool> {
+    if home.runner_alive() {
+        return Ok(false);
+    }
+    let exe = std::env::current_exe().context("finding the lf binary to start the runner")?;
+    let mut child = Command::new(exe)
+        .arg("--home")
+        .arg(home.root())
+        .arg("run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // Its own process group: a Ctrl-C in our terminal isn't meant for it.
+        .process_group(0)
+        .spawn()
+        .context("starting the runner")?;
+    let mut exited = None;
+    let up = wait_for(RUNNER_WAIT, || {
+        if home.runner_alive() {
+            return true;
+        }
+        exited = child.try_wait().ok().flatten();
+        exited.is_some()
+    });
+    if let Some(status) = exited {
+        bail!(
+            "the runner exited right away ({status}); see {}",
+            home.runner_log().display()
+        );
+    }
+    if !up {
+        let _ = child.kill();
+        bail!(
+            "the runner didn't come up within {}s",
+            RUNNER_WAIT.as_secs()
+        );
+    }
+    // Reap it when it eventually exits, instead of leaving a zombie behind
+    // in a long-lived dashboard.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(true)
+}
+
+/// Asks the running runner to exit. Tasks already running keep going in
+/// their tmux windows; the next runner picks them back up. Returns the
+/// runner's pid, or `None` if none was running.
+pub fn stop_runner(home: &Home) -> Result<Option<u32>> {
+    if !home.runner_alive() {
+        return Ok(None);
+    }
+    // A runner that's only just started writes its pid a moment after
+    // taking the lock.
+    let mut pid = None;
+    wait_for(Duration::from_secs(2), || {
+        pid = home.runner_pid();
+        pid.is_some() || !home.runner_alive()
+    });
+    let Some(pid) = pid else {
+        // It exited by itself while we were looking.
+        return Ok(None);
+    };
+    let pid_t = i32::try_from(pid).context("the runner's pid is out of range")?;
+    // SAFETY: plain kill(2) on a pid read from the lock the runner holds.
+    if unsafe { libc::kill(pid_t, libc::SIGTERM) } != 0 {
+        let err = std::io::Error::last_os_error();
+        bail!("couldn't stop the runner (pid {pid}): {err}");
+    }
+    if !wait_for(RUNNER_WAIT, || !home.runner_alive()) {
+        bail!(
+            "the runner (pid {pid}) is still running {}s after being asked to stop; \
+             `kill -9 {pid}` will force it",
+            RUNNER_WAIT.as_secs()
+        );
+    }
+    Ok(Some(pid))
+}
 
 /// Runs `on_finish` and archives the task as done. Works on running tasks
 /// (ending their session), on `needs_review` ones, and on failed ones, e.g.

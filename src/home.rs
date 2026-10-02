@@ -1,4 +1,5 @@
 use std::fs::TryLockError;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -112,13 +113,25 @@ impl Home {
 
     /// Claims the right to be *the* `lf run` for this home, until the
     /// returned file is dropped (or the process dies). Fails if another
-    /// runner holds it.
+    /// runner holds it. While held, the file contains this process's pid, so
+    /// `lf stop` knows who to ask to stop (see [`runner_pid`](Self::runner_pid)).
     pub fn claim_runner(&self) -> Result<std::fs::File> {
         let path = self.root.join(".runner.lock");
-        let file =
-            std::fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;
+        // Not `File::create`: that would wipe a running runner's pid just
+        // by trying (and failing) to take the lock.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
         match file.try_lock() {
-            Ok(()) => Ok(file),
+            Ok(()) => {
+                file.set_len(0)
+                    .and_then(|()| write!(file, "{}", std::process::id()))
+                    .with_context(|| format!("writing {}", path.display()))?;
+                Ok(file)
+            }
             Err(TryLockError::WouldBlock) => {
                 bail!(
                     "another `lf run` is already running for {}",
@@ -137,6 +150,20 @@ impl Home {
             return false;
         };
         matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock))
+    }
+
+    /// The pid of the running runner, if there is one and it has written it
+    /// yet. Only trusted while the lock is held, so a stale file from a dead
+    /// runner (whose pid something else may have reused) is never returned.
+    pub fn runner_pid(&self) -> Option<u32> {
+        if !self.runner_alive() {
+            return None;
+        }
+        std::fs::read_to_string(self.root.join(".runner.lock"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     /// Fails with a helpful message if `lf init` has not been run.
@@ -223,6 +250,24 @@ mod tests {
     fn resolve_expands_a_leading_tilde() {
         let home = Home::resolve(Some(PathBuf::from("~/.loompa-forge-test"))).unwrap();
         assert_eq!(home.root(), home_dir().unwrap().join(".loompa-forge-test"));
+    }
+
+    #[test]
+    fn the_runner_lock_holds_its_pid_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::resolve(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(home.runner_pid(), None);
+
+        let claim = home.claim_runner().unwrap();
+        assert_eq!(home.runner_pid(), Some(std::process::id()));
+
+        // A second runner is refused, and doesn't disturb the first's pid.
+        assert!(home.claim_runner().is_err());
+        assert_eq!(home.runner_pid(), Some(std::process::id()));
+
+        // Once released, the leftover file is not mistaken for a live runner.
+        drop(claim);
+        assert_eq!(home.runner_pid(), None);
     }
 
     #[test]

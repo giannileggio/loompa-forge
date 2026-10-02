@@ -60,6 +60,12 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
     .is_ok()
 }
 
+/// The top-level folder of the git repo containing `dir`, if there is one.
+pub fn repo_root(dir: &Path) -> Result<std::path::PathBuf> {
+    let out = git(dir, &["rev-parse", "--show-toplevel"])?;
+    Ok(std::path::PathBuf::from(out.trim()))
+}
+
 /// The repo's shared `.git` directory, as an absolute path. The same for a
 /// repo and all of its linked worktrees.
 fn common_dir(dir: &Path) -> Result<std::path::PathBuf> {

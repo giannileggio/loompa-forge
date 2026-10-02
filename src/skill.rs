@@ -7,6 +7,7 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -25,6 +26,21 @@ const INSTRUCTION_POINTERS: &[&str] = &["CLAUDE.md", "GEMINI.md"];
 const SKILL_DIRS: &[&str] = &[".claude/skills"];
 
 const SKILL: &str = "lf-tasks";
+
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Silences the "wrote ..." lines of [`note`], for the automatic first-run
+/// setup, where a list of internal files would only be noise.
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
+/// Reports a file `lf init` wrote, kept or linked.
+pub fn note(line: impl std::fmt::Display) {
+    if !QUIET.load(Ordering::Relaxed) {
+        println!("{line}");
+    }
+}
 
 /// Writes the agent files into the home. AGENTS.md and the pointers are the
 /// user's to edit, so they're only written if missing; FORMAT.md and the
@@ -128,7 +144,10 @@ fn link(target: &Path, at: &Path) -> Result<()> {
     if at.is_symlink() {
         std::fs::remove_file(at).with_context(|| format!("removing {}", at.display()))?;
     } else if at.exists() {
-        println!("kept existing {} (not a link made by lf)", at.display());
+        note(format_args!(
+            "kept existing {} (not a link made by lf)",
+            at.display()
+        ));
         return Ok(());
     }
     if let Some(dir) = at.parent() {
@@ -136,16 +155,20 @@ fn link(target: &Path, at: &Path) -> Result<()> {
     }
     std::os::unix::fs::symlink(target, at)
         .with_context(|| format!("linking {} to {}", at.display(), target.display()))?;
-    println!("linked {} -> {}", at.display(), target.display());
+    note(format_args!(
+        "linked {} -> {}",
+        at.display(),
+        target.display()
+    ));
     Ok(())
 }
 
 pub fn write_if_missing(path: &Path, contents: &str) -> Result<()> {
     if path.exists() {
-        println!("kept existing {}", path.display());
+        note(format_args!("kept existing {}", path.display()));
     } else {
         std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-        println!("wrote {}", path.display());
+        note(format_args!("wrote {}", path.display()));
     }
     Ok(())
 }
@@ -155,7 +178,7 @@ fn overwrite(path: &Path, contents: &str) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    println!("wrote {}", path.display());
+    note(format_args!("wrote {}", path.display()));
     Ok(())
 }
 

@@ -151,6 +151,68 @@
     background: var(--failed); color: #fff; font-size: 13px; display: none; z-index: 20;
   }
   .toast.active { display: block; }
+  header .primary {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  header .primary:hover { filter: brightness(1.1); }
+  .toast.ok { background: var(--done); }
+  .notice {
+    margin: 12px 20px 0; padding: 10px 14px; border-radius: 6px; font-size: 13px;
+    border: 1px solid var(--review); background: rgba(217,119,6,.1);
+  }
+  .notice[hidden] { display: none; }
+  .empty .big { font-size: 16px; color: var(--text); margin-bottom: 6px; }
+  .empty button { margin-top: 12px; }
+  .btn {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .btn.secondary { background: none; color: var(--text); border: 1px solid var(--border); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  form.new-task { padding: 16px; display: flex; flex-direction: column; gap: 14px; overflow: auto; }
+  form.new-task label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 600; }
+  form.new-task label small { font-weight: 400; color: var(--muted); }
+  form.new-task textarea, form.new-task input, form.new-task select {
+    font: inherit; font-weight: 400; padding: 8px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  }
+  form.new-task textarea { min-height: 110px; resize: vertical; }
+  form.new-task .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+  form.new-task .buttons { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+  form.new-task .error { color: var(--failed); font-size: 12px; margin-right: auto; white-space: pre-line; }
+  .why { color: var(--muted); font-size: 11px; max-width: 280px; white-space: normal; margin-top: 2px; }
+  header .ghost, .notice .btn { font-size: 12px; }
+  header .ghost {
+    background: none; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; cursor: pointer;
+  }
+  header .ghost:hover { background: rgba(127,127,127,.12); }
+  .linkish { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0 0 0 6px; font-size: inherit; text-decoration: underline; }
+  .notice .btn { margin-left: 8px; padding: 4px 10px; }
+  .notice.bad { border-color: var(--failed); background: rgba(220,38,38,.08); }
+  ul.checks { list-style: none; margin: 0; padding: 12px 16px; overflow: auto; }
+  ul.checks li { display: flex; gap: 10px; padding: 6px 0; font-size: 13px; border-bottom: 1px solid var(--border); }
+  ul.checks li:last-child { border-bottom: none; }
+  ul.checks .ico { font-weight: 700; width: 16px; flex: none; text-align: center; }
+  ul.checks .c-ok .ico { color: var(--done); }
+  ul.checks .c-warn .ico { color: var(--review); }
+  ul.checks .c-fail .ico { color: var(--failed); }
+  .modal .foot { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+  .modal .foot .btn { margin-left: auto; }
+  .modal .body { overflow: auto; }
+  h3.sub { margin: 0; padding: 12px 16px 0; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  ul.agents { list-style: none; margin: 0; padding: 4px 16px 12px; }
+  ul.agents li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  ul.agents li:last-child { border-bottom: none; }
+  ul.agents .name { font-weight: 600; min-width: 80px; }
+  ul.agents code.cmd { flex: 1 1 260px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 3px 8px; font-size: 12px; overflow-x: auto; white-space: nowrap; }
+  ul.agents button { font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; }
+  ul.agents button:hover { background: rgba(127,127,127,.12); }
+  p.hint { margin: 0; padding: 0 16px 12px; font-size: 12px; color: var(--muted); }
+  .badge.active { background: var(--done); }
+  .badge.paused { background: var(--cancelled); }
+  form.new-task [hidden] { display: none; }
   .warn { margin: 8px 16px; padding: 8px 12px; border: 1px solid var(--failed); border-radius: 6px; font-size: 13px; }
   .warn[hidden] { display: none; }
 </style>
@@ -161,16 +223,25 @@
   <span class="home mono" id="home"></span>
   <span class="updated" id="runner"></span>
   <span class="updated"><span class="dot"></span>as of <span id="updated">-</span></span>
+  <button class="ghost" id="setup-open" title="Pick and install your coding agent, and check that tmux and git are set up">Setup</button>
+  <button class="primary" id="new-task-open">+ New task</button>
 </header>
+
+<div class="notice" id="runner-notice" hidden>
+  <strong>Nothing will start yet: the runner is off.</strong>
+  The runner is what picks up waiting tasks and hands them to an agent. Tasks you add now just wait.
+  <button class="btn" data-action="runner-start" id="runner-start">Start the runner</button>
+</div>
+<div class="notice bad" id="setup-notice" hidden></div>
 
 <div class="stats" id="stats"></div>
 <div class="warn" id="invalid" hidden></div>
 
 <nav id="tabs">
-  <button data-tab="queue" class="active">Queue <span class="count" id="c-queue">0</span></button>
-  <button data-tab="running">Busy <span class="count" id="c-running">0</span></button>
-  <button data-tab="archive">Archive <span class="count" id="c-archive">0</span></button>
-  <button data-tab="schedules">Schedules <span class="count" id="c-schedules">0</span></button>
+  <button data-tab="queue" class="active" title="Tasks waiting for their turn">Waiting <span class="count" id="c-queue">0</span></button>
+  <button data-tab="running" title="Tasks an agent is working on right now">Working <span class="count" id="c-running">0</span></button>
+  <button data-tab="archive" title="Tasks that are done, failed or cancelled">Finished <span class="count" id="c-archive">0</span></button>
+  <button data-tab="schedules" title="Tasks that are queued again on a schedule">Repeating <span class="count" id="c-schedules">0</span></button>
 </nav>
 
 <main>
@@ -189,15 +260,111 @@
     <pre id="logs-body">loading&hellip;</pre>
   </div>
 </div>
+
+<div class="overlay" id="new-overlay">
+  <div class="modal">
+    <header>
+      <h2 id="new-title">New task</h2>
+      <button id="new-close" aria-label="Close">&times;</button>
+    </header>
+    <form class="new-task" id="new-form">
+      <label>What should the agent do?
+        <textarea id="f-prompt" required autofocus
+          placeholder="e.g. Fix the redirect loop after login, and add a test for it"></textarea>
+        <small>Write it like a message to a teammate. Include anything it can't guess.</small>
+      </label>
+      <label>Which project?
+        <input id="f-repo" list="f-repos" required autocomplete="off" placeholder="~/Projects/myapp">
+        <datalist id="f-repos"></datalist>
+        <small>The folder of a git repository on this machine.</small>
+      </label>
+      <div class="row">
+        <label id="f-repeat-wrap">How often?
+          <select id="f-repeat"></select>
+        </label>
+        <label id="f-start-wrap">Start
+          <select id="f-start"></select>
+        </label>
+        <label id="f-day-wrap" hidden>On
+          <select id="f-day">
+            <option value="1">Monday</option><option value="2">Tuesday</option>
+            <option value="3">Wednesday</option><option value="4">Thursday</option>
+            <option value="5">Friday</option><option value="6">Saturday</option>
+            <option value="0">Sunday</option>
+          </select>
+        </label>
+        <label id="f-time-wrap" hidden>At
+          <input type="time" id="f-time" value="09:00">
+        </label>
+      </div>
+      <label id="f-cron-wrap" hidden>Schedule (cron)
+        <input id="f-cron" class="mono" autocomplete="off" placeholder="0 9 * * 1-5">
+        <small>Five fields: minute, hour, day of month, month, day of week. Your local time.</small>
+      </label>
+      <div class="row">
+        <label>When it's done
+          <select id="f-finish">
+            <option value="none">Leave the changes for me to review</option>
+            <option value="commit">Commit them</option>
+            <option value="push">Commit and push</option>
+            <option value="pr">Open a pull request</option>
+          </select>
+        </label>
+        <label id="f-agent-wrap" hidden>Agent
+          <select id="f-agent"></select>
+        </label>
+      </div>
+      <div class="buttons">
+        <span class="error" id="f-error"></span>
+        <button type="button" class="btn secondary" id="new-cancel">Cancel</button>
+        <button type="submit" class="btn" id="f-submit">Queue task</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="overlay" id="setup-overlay">
+  <div class="modal">
+    <header>
+      <h2>Setup</h2>
+      <button id="setup-close" aria-label="Close">&times;</button>
+    </header>
+    <div class="body">
+      <h3 class="sub">Coding agents</h3>
+      <ul class="agents" id="agent-list"><li>checking&hellip;</li></ul>
+      <p class="hint" id="agent-hint"></p>
+      <h3 class="sub">Checks</h3>
+      <ul class="checks" id="setup-list"><li>checking&hellip;</li></ul>
+    </div>
+    <div class="foot">
+      <span>&#10007; stops tasks from running; &#9888; is worth a look.</span>
+      <button class="btn secondary" id="setup-again">Check again</button>
+    </div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 
 <script>
 const TOKEN = document.querySelector('meta[name="lf-token"]').content;
 const STAT_LABELS = [
-  ["pending", "Pending"], ["running", "Running"], ["done", "Done"],
-  ["failed", "Failed"], ["cancelled", "Cancelled"], ["needs_review", "Review"],
-  ["schedules", "Schedules"],
+  ["pending", "Waiting"], ["running", "Working"], ["done", "Done"],
+  ["failed", "Failed"], ["cancelled", "Cancelled"], ["needs_review", "Needs review"],
+  ["schedules", "Repeating"],
 ];
+
+// The words the page uses for the statuses in the task files and `lf ls`.
+const STATUS_LABELS = {
+  pending: "Waiting", running: "Working", done: "Done", failed: "Failed",
+  cancelled: "Cancelled", needs_review: "Needs review",
+};
+const STATUS_HELP = {
+  pending: "Queued: it starts when the runner picks it up (or at its start time).",
+  running: "An agent is working on it right now.",
+  done: "Finished successfully.",
+  failed: "It didn't work out. The reason is shown; you can try again.",
+  cancelled: "Stopped before it finished.",
+  needs_review: "The interactive session ended without being marked done or failed. Look at the result, then mark it done or try again.",
+};
 
 // Task fields (branch names, repo paths, cron strings, ids, ...) come from
 // task/schedule files the user or an agent wrote, not from lf itself, so
@@ -209,11 +376,12 @@ function escapeHtml(s) {
 }
 
 function badge(status) {
-  return `<span class="badge ${escapeHtml(status)}">${escapeHtml(status.replace("_", " "))}</span>`;
+  const label = STATUS_LABELS[status] || status.replace("_", " ");
+  return `<span class="badge ${escapeHtml(status)}" title="${escapeHtml(STATUS_HELP[status] || "")}">${escapeHtml(label)}</span>`;
 }
 
-function taskTable(rows, cols) {
-  if (rows.length === 0) return `<div class="empty">Nothing here.</div>`;
+function taskTable(rows, cols, empty) {
+  if (rows.length === 0) return empty || `<div class="empty">Nothing here.</div>`;
   const head = cols.map(c => `<th>${escapeHtml(c.label)}</th>`).join("");
   const body = rows.map(r => `<tr>${cols.map(c => `<td class="${c.mono ? "mono" : ""}">${c.render ? c.render(r) : escapeHtml(r[c.key])}</td>`).join("")}</tr>`).join("");
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
@@ -221,7 +389,7 @@ function taskTable(rows, cols) {
 
 // Which action buttons make sense for a task in this status.
 const ACTIONS_FOR_STATUS = {
-  pending: ["cancel"],
+  pending: ["edit", "cancel"],
   running: ["done", "fail", "cancel"],
   needs_review: ["done", "fail", "retry"],
   failed: ["retry"],
@@ -229,7 +397,15 @@ const ACTIONS_FOR_STATUS = {
   done: [],
 };
 
-const ACTION_LABELS = { done: "Done", fail: "Fail", cancel: "Cancel", retry: "Retry", logs: "Logs" };
+const ACTION_LABELS = { edit: "Edit", done: "Mark done", fail: "Give up", cancel: "Cancel", retry: "Try again", logs: "Output" };
+const ACTION_HELP = {
+  edit: "Change what it will do, where, or when it starts.",
+  done: "Finish it: runs the when-done step and moves it to Finished.",
+  fail: "Stop for good, without retrying.",
+  cancel: "Drop it. The when-done step doesn't run.",
+  retry: "Put it back in the queue, in the same workspace.",
+  logs: "See what the agent printed.",
+};
 const DANGER_ACTIONS = new Set(["fail", "cancel"]);
 const CONFIRM_ACTIONS = new Set(["fail", "cancel"]);
 
@@ -237,15 +413,16 @@ function actionButtons(r) {
   const acts = [...(ACTIONS_FOR_STATUS[r.status] || [])];
   acts.push("logs"); // always offered; the endpoint reports if there's nothing yet
   return acts.map(a =>
-    `<button data-id="${escapeHtml(r.id)}" data-action="${a}" class="${DANGER_ACTIONS.has(a) ? "danger" : ""}">${ACTION_LABELS[a]}</button>`
+    `<button data-id="${escapeHtml(r.id)}" data-action="${a}" title="${escapeHtml(ACTION_HELP[a])}" class="${DANGER_ACTIONS.has(a) ? "danger" : ""}">${ACTION_LABELS[a]}</button>`
   ).join("");
 }
 
 const TASK_COLS = [
   { key: "id", label: "ID", mono: true },
-  { key: "status", label: "Status", render: r => badge(r.status) },
+  { key: "status", label: "Status", render: r => badge(r.status) +
+      (r.error && r.status !== "done" ? `<div class="why">${escapeHtml(r.error)}</div>` : "") },
   { key: "when", label: "When" },
-  { key: "repo", label: "Repo", mono: true },
+  { key: "repo", label: "Project", mono: true },
   { key: "branch", label: "Branch", mono: true },
   { key: "agent", label: "Agent" },
   { key: "tokens", label: "Tokens", mono: true },
@@ -253,12 +430,54 @@ const TASK_COLS = [
   { key: "actions", label: "", render: r => `<div class="actions">${actionButtons(r)}</div>` },
 ];
 
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+// The schedule form's friendly choices <-> the cron expression they mean.
+function cronFor(repeat, time, day, custom) {
+  const [h, m] = (time || "09:00").split(":").map(n => parseInt(n, 10));
+  switch (repeat) {
+    case "hourly": return "0 * * * *";
+    case "daily": return `${m} ${h} * * *`;
+    case "weekdays": return `${m} ${h} * * 1-5`;
+    case "weekly": return `${m} ${h} * * ${day}`;
+    default: return custom.trim();
+  }
+}
+
+function parseCron(cron) {
+  const c = cron.trim();
+  if (c === "0 * * * *") return { repeat: "hourly" };
+  const m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* (\*|1-5|[0-6])$/);
+  if (!m || +m[1] > 59 || +m[2] > 23) return { repeat: "custom" };
+  const time = `${m[2].padStart(2, "0")}:${m[1].padStart(2, "0")}`;
+  if (m[3] === "*") return { repeat: "daily", time };
+  if (m[3] === "1-5") return { repeat: "weekdays", time };
+  return { repeat: "weekly", time, day: m[3] };
+}
+
+function describeCron(cron) {
+  const p = parseCron(cron);
+  if (p.repeat === "hourly") return "Every hour";
+  if (p.repeat === "daily") return `Every day at ${p.time}`;
+  if (p.repeat === "weekdays") return `Every weekday at ${p.time}`;
+  if (p.repeat === "weekly") return `Every ${DAY_NAMES[p.day]} at ${p.time}`;
+  return cron;
+}
+
 const SCHEDULE_COLS = [
-  { key: "id", label: "ID", mono: true },
-  { key: "enabled", label: "Enabled", render: r => r.enabled ? "yes" : "no" },
-  { key: "cron", label: "Cron", mono: true },
+  { key: "summary", label: "What", render: r => escapeHtml(r.summary) + `<div class="why mono">${escapeHtml(r.id)}</div>` },
+  { key: "enabled", label: "Status", render: r => r.enabled
+      ? `<span class="badge active" title="It adds a task each time it comes round.">Active</span>`
+      : `<span class="badge paused" title="Paused: it adds nothing until you resume it.">Paused</span>` },
+  { key: "cron", label: "Repeats", render: r => `<span title="${escapeHtml(r.cron)}">${escapeHtml(describeCron(r.cron))}</span>` },
   { key: "next", label: "Next run" },
-  { key: "repo", label: "Repo", mono: true },
+  { key: "repo", label: "Project", mono: true },
+  { key: "actions", label: "", render: r => `<div class="actions">
+      <button data-id="${escapeHtml(r.id)}" data-action="sched-edit" title="Change what it does or when">Edit</button>
+      <button data-id="${escapeHtml(r.id)}" data-action="${r.enabled ? "sched-pause" : "sched-resume"}"
+        title="${r.enabled ? "Stop adding tasks until you resume it" : "Start adding tasks again"}">${r.enabled ? "Pause" : "Resume"}</button>
+      <button class="danger" data-id="${escapeHtml(r.id)}" data-action="sched-delete" title="Remove the schedule. Tasks it already added stay.">Delete</button>
+    </div>` },
 ];
 
 async function refresh() {
@@ -274,9 +493,12 @@ async function refresh() {
   document.getElementById("updated").textContent = state.generated_at;
 
   const runner = document.getElementById("runner");
-  runner.textContent = state.runner.alive
-    ? `runner: running${state.runner.last_tick ? ` (last pass ${state.runner.last_tick})` : ""}`
-    : "runner: not running (start it with `lf run`)";
+  runner.innerHTML = state.runner.alive
+    ? `runner: on${state.runner.last_tick ? ` (last pass ${escapeHtml(state.runner.last_tick)})` : ""}` +
+      `<button class="linkish" data-action="runner-stop" title="Stop picking up new tasks. Work already underway keeps going.">stop</button>`
+    : "runner: off";
+  document.getElementById("runner-notice").hidden = state.runner.alive;
+  formInfo = state.form;
 
   const invalid = document.getElementById("invalid");
   invalid.hidden = state.invalid.length === 0;
@@ -292,23 +514,35 @@ async function refresh() {
     document.getElementById(`c-${tab}`).textContent = state[tab].length;
   }
 
-  document.getElementById("panel-queue").innerHTML = taskTable(state.queue, TASK_COLS);
-  document.getElementById("panel-running").innerHTML = taskTable(state.running, TASK_COLS);
-  document.getElementById("panel-archive").innerHTML = taskTable(state.archive, TASK_COLS);
-  document.getElementById("panel-schedules").innerHTML = taskTable(state.schedules, SCHEDULE_COLS);
+  const firstRun = state.queue.length + state.running.length + state.archive.length === 0;
+  document.getElementById("panel-queue").innerHTML = taskTable(state.queue, TASK_COLS, firstRun
+    ? `<div class="empty"><div class="big">No tasks yet</div>
+         Describe some work and an agent will do it while you're away.<br>
+         <button class="btn" data-action="new">+ New task</button></div>`
+    : `<div class="empty">Nothing is waiting.</div>`);
+  document.getElementById("panel-running").innerHTML = taskTable(state.running, TASK_COLS,
+    `<div class="empty">Nothing is being worked on right now.</div>`);
+  document.getElementById("panel-archive").innerHTML = taskTable(state.archive, TASK_COLS,
+    `<div class="empty">Nothing has finished yet.</div>`);
+  document.getElementById("panel-schedules").innerHTML = taskTable(state.schedules, SCHEDULE_COLS,
+    `<div class="empty">No repeating tasks yet. A schedule is a Markdown file in <code>${escapeHtml(state.home)}/schedules</code>; see the README.</div>`);
+}
+
+function showTab(name) {
+  for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === name);
+  for (const p of document.querySelectorAll(".panel")) p.classList.toggle("active", p.id === `panel-${name}`);
 }
 
 document.getElementById("tabs").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-tab]");
-  if (!btn) return;
-  for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b === btn);
-  for (const p of document.querySelectorAll(".panel")) p.classList.toggle("active", p.id === `panel-${btn.dataset.tab}`);
+  if (btn) showTab(btn.dataset.tab);
 });
 
 let toastTimer = null;
-function toast(msg) {
+function toast(msg, ok) {
   const el = document.getElementById("toast");
   el.textContent = msg;
+  el.classList.toggle("ok", !!ok);
   el.classList.add("active");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove("active"), 4000);
@@ -337,11 +571,12 @@ logsOverlay.addEventListener("click", (e) => { if (e.target === logsOverlay) log
 async function runAction(id, action) {
   let body;
   if (action === "fail") {
-    const reason = prompt(`Reason for failing ${id} (optional):`, "");
+    const reason = prompt(`Why are you giving up on ${id}? (optional)`, "");
     if (reason === null) return; // cancelled
     body = JSON.stringify({ reason });
   }
-  if (CONFIRM_ACTIONS.has(action) && !confirm(`${ACTION_LABELS[action]} ${id}?`)) return;
+  const confirmText = { fail: `Give up on ${id}? It won't be retried.`, cancel: `Cancel ${id}?` };
+  if (CONFIRM_ACTIONS.has(action) && action !== "fail" && !confirm(confirmText[action])) return;
 
   try {
     const res = await fetch(`/api/tasks/${encodeURIComponent(id)}/${action}`, {
@@ -363,14 +598,330 @@ document.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-action]");
   if (!btn) return;
   const { id, action } = btn.dataset;
-  if (action === "logs") {
+  if (action === "setup") {
+    openSetup();
+  } else if (action === "new") {
+    openForm("new");
+  } else if (action === "edit") {
+    editTask(id);
+  } else if (action.startsWith("sched-")) {
+    scheduleAction(id, action.slice("sched-".length));
+  } else if (action === "copy") {
+    copyText(btn.dataset.text);
+  } else if (action === "use-agent") {
+    useAgent(btn.dataset.name, btn);
+  } else if (action === "runner-start" || action === "runner-stop") {
+    runnerAction(action === "runner-start" ? "start" : "stop", btn);
+  } else if (action === "logs") {
     showLogs(id);
   } else {
     runAction(id, action);
   }
 });
 
+// ---- Runner on/off
+
+async function runnerAction(what, btn) {
+  if (what === "stop" && !confirm("Stop the runner? Work already underway keeps going, but nothing new starts until you turn it back on.")) return;
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/runner/${what}`, { method: "POST", headers: { "X-LF-Token": TOKEN } });
+    const data = await res.json();
+    if (!res.ok) toast(data.error || `couldn't ${what} the runner`);
+    else toast(what === "start" ? "Runner started" : "Runner stopped", true);
+  } catch (e) {
+    toast(String(e));
+  }
+  btn.disabled = false;
+  refresh();
+}
+
+// ---- Setup: coding agents and checks
+
+const setupOverlay = document.getElementById("setup-overlay");
+const setupList = document.getElementById("setup-list");
+const agentList = document.getElementById("agent-list");
+const ICONS = { ok: "✓", warn: "⚠", fail: "✗" };
+
+async function loadSetup() {
+  const res = await fetch("/api/doctor");
+  return (await res.json()).checks;
+}
+
+async function loadAgents() {
+  const res = await fetch("/api/agents");
+  return (await res.json()).agents;
+}
+
+function renderSetup(checks) {
+  setupList.innerHTML = checks.map(c =>
+    `<li class="c-${c.level}"><span class="ico">${ICONS[c.level]}</span><span>${escapeHtml(c.message)}</span></li>`
+  ).join("");
+}
+
+function renderAgents(agents) {
+  agentList.innerHTML = agents.map(a => {
+    const state = a.installed
+      ? `<span class="badge done">installed</span>`
+      : `<span class="badge cancelled">not installed</span>`;
+    let action = a.is_default ? `<span class="badge active">default</span>` : "";
+    if (a.installed && !a.is_default) {
+      action = `<button data-action="use-agent" data-name="${escapeHtml(a.name)}">Use this one</button>`;
+    } else if (!a.installed && a.install) {
+      // Shown even for the default: that's the one that most needs installing.
+      action += `<code class="cmd mono">${escapeHtml(a.install)}</code>` +
+        `<button data-action="copy" data-text="${escapeHtml(a.install)}">Copy</button>`;
+    }
+    return `<li><span class="name">${escapeHtml(a.name)}</span>${state}${action}</li>`;
+  }).join("");
+  const any = agents.some(a => a.installed);
+  document.getElementById("agent-hint").textContent = any
+    ? "Tasks use the default agent unless one is chosen for them."
+    : "Run an install command in a terminal (it needs Node.js), then run the agent once there to sign in. This page notices when it's installed.";
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast("Copied", true); }
+  catch (e) { toast("Couldn't copy: select the command and copy it by hand"); }
+}
+
+async function useAgent(name, btn) {
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/agents/default", {
+      method: "POST",
+      headers: { "X-LF-Token": TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ agent: name }),
+    });
+    const data = await res.json();
+    if (!res.ok) toast(data.error || "couldn't change the default agent");
+    else toast(`${name} is now the default agent`, true);
+  } catch (e) { toast(String(e)); }
+  loadAgents().then(renderAgents).catch(() => {});
+  checkSetupQuietly();
+  refresh();
+}
+
+// A banner only when something needs attention; the full list is one click away.
+async function checkSetupQuietly() {
+  const notice = document.getElementById("setup-notice");
+  try {
+    const [checks, agents] = await Promise.all([loadSetup(), loadAgents()]);
+    const problems = checks.filter(c => c.level !== "ok");
+    if (!agents.some(a => a.installed)) {
+      problems.unshift({ level: "fail", message: "No coding agent is installed yet, and tasks need one to do the work." });
+    }
+    if (problems.length === 0) { notice.hidden = true; return; }
+    const worst = problems.find(c => c.level === "fail") || problems[0];
+    notice.hidden = false;
+    notice.classList.toggle("bad", problems.some(c => c.level === "fail"));
+    notice.innerHTML = `<strong>${problems.length === 1 ? "One thing needs attention" : problems.length + " things need attention"}:</strong> ` +
+      `${escapeHtml(worst.message)}<button class="linkish" data-action="setup">Open setup</button>`;
+  } catch (e) { /* the page still works without it */ }
+}
+
+async function openSetup() {
+  setupList.innerHTML = "<li>checking&hellip;</li>";
+  agentList.innerHTML = "<li>checking&hellip;</li>";
+  setupOverlay.classList.add("active");
+  loadAgents().then(renderAgents).catch(e => { agentList.innerHTML = `<li>${escapeHtml(String(e))}</li>`; });
+  try { renderSetup(await loadSetup()); }
+  catch (e) { setupList.innerHTML = `<li class="c-fail"><span class="ico">${ICONS.fail}</span><span>${escapeHtml(String(e))}</span></li>`; }
+}
+
+document.getElementById("setup-open").addEventListener("click", openSetup);
+document.getElementById("setup-again").addEventListener("click", async () => { await openSetup(); checkSetupQuietly(); });
+document.getElementById("setup-close").addEventListener("click", () => setupOverlay.classList.remove("active"));
+setupOverlay.addEventListener("click", (e) => { if (e.target === setupOverlay) setupOverlay.classList.remove("active"); });
+
+// ---- The task / schedule form
+//
+// One form for four jobs, depending on `formMode`: queue a task (kind "new",
+// "Just once"), create a schedule (kind "new", anything else), edit a waiting
+// task (kind "task"), edit a schedule (kind "schedule").
+
+let formInfo = null;
+let formMode = { kind: "new" };
+let draftPrompt = ""; // what was typed into "New task" before it was closed
+const newOverlay = document.getElementById("new-overlay");
+const newForm = document.getElementById("new-form");
+const fError = document.getElementById("f-error");
+const fSubmit = document.getElementById("f-submit");
+const $ = (id) => document.getElementById(id);
+
+const REPEAT_OPTIONS = [
+  ["once", "Just once"], ["hourly", "Every hour"], ["daily", "Every day"],
+  ["weekdays", "Every weekday"], ["weekly", "Every week"], ["custom", "Custom schedule…"],
+];
+
+// Shows the fields the current choices need.
+function syncFormFields() {
+  const kind = formMode.kind;
+  const repeat = kind === "task" ? "once" : $("f-repeat").value;
+  $("f-repeat-wrap").hidden = kind === "task";
+  $("f-start-wrap").hidden = repeat !== "once";
+  $("f-time-wrap").hidden = !["daily", "weekdays", "weekly"].includes(repeat);
+  $("f-day-wrap").hidden = repeat !== "weekly";
+  $("f-cron-wrap").hidden = repeat !== "custom";
+  $("f-cron").required = repeat === "custom";
+  if (kind === "new") $("new-title").textContent = repeat === "once" ? "New task" : "New repeating task";
+  $("f-submit").textContent = kind === "task" || kind === "schedule" ? "Save changes"
+    : repeat === "once" ? "Queue task" : "Create schedule";
+}
+
+function openForm(kind, v) {
+  const info = formInfo || { repos: [], agents: [], agent: null, on_finish: "none" };
+  formMode = { kind, id: v && v.id };
+  $("new-title").textContent = kind === "task" ? `Edit ${v.id}`
+    : kind === "schedule" ? "Edit schedule" : "New task";
+
+  $("f-prompt").value = v ? v.prompt : draftPrompt;
+  $("f-repo").value = v ? v.repo : (info.repos[0] || "");
+  $("f-repos").innerHTML = info.repos.map(r => `<option value="${escapeHtml(r)}"></option>`).join("");
+  $("f-finish").value = v ? v.on_finish : info.on_finish;
+
+  // Only worth asking when there's a real choice of agent.
+  const agents = [...info.agents];
+  const current = v && v.agent ? v.agent : info.agent;
+  if (current && !agents.includes(current)) agents.push(current);
+  $("f-agent-wrap").hidden = agents.length < 2;
+  $("f-agent").innerHTML = agents.map(a =>
+    `<option value="${escapeHtml(a)}"${a === current ? " selected" : ""}>${escapeHtml(a)}</option>`
+  ).join("");
+
+  // How often: schedules can't be "just once".
+  const repeats = kind === "schedule" ? REPEAT_OPTIONS.slice(1) : REPEAT_OPTIONS;
+  $("f-repeat").innerHTML = repeats.map(([val, label]) => `<option value="${val}">${label}</option>`).join("");
+  $("f-time").value = "09:00";
+  $("f-day").value = "1";
+  $("f-cron").value = "";
+  if (kind === "schedule") {
+    const p = parseCron(v.cron);
+    $("f-repeat").value = p.repeat;
+    if (p.time) $("f-time").value = p.time;
+    if (p.day) $("f-day").value = p.day;
+    if (p.repeat === "custom") $("f-cron").value = v.cron;
+  }
+
+  // Start: a waiting task can also keep the time it has.
+  const starts = [["asap", "As soon as possible"], ["1h", "In 1 hour"], ["3h", "In 3 hours"], ["8h", "In 8 hours"]];
+  if (kind === "task") starts.unshift(["keep", v.starts ? `Keep (${v.starts})` : "Keep (as soon as possible)"]);
+  $("f-start").innerHTML = starts.map(([val, label]) => `<option value="${val}">${label}</option>`).join("");
+
+  syncFormFields();
+  fError.textContent = "";
+  newOverlay.classList.add("active");
+  $("f-prompt").focus();
+}
+
+function closeForm() {
+  if (newOverlay.classList.contains("active") && formMode.kind === "new") draftPrompt = $("f-prompt").value;
+  newOverlay.classList.remove("active");
+}
+
+async function editTask(id) {
+  try {
+    const res = await fetch(`/api/tasks/${encodeURIComponent(id)}`);
+    const data = await res.json();
+    if (!res.ok) { toast(data.error || "can't edit that task"); refresh(); return; }
+    openForm("task", data);
+  } catch (e) { toast(String(e)); }
+}
+
+async function scheduleAction(id, verb) {
+  if (verb === "edit") {
+    try {
+      const res = await fetch(`/api/schedules/${encodeURIComponent(id)}`);
+      const data = await res.json();
+      if (!res.ok) { toast(data.error || "can't edit that schedule"); return; }
+      openForm("schedule", data);
+    } catch (e) { toast(String(e)); }
+    return;
+  }
+  if (verb === "delete" && !confirm(`Delete the schedule ${id}? Tasks it already added stay in the queue.`)) return;
+  try {
+    const res = await fetch(`/api/schedules/${encodeURIComponent(id)}/${verb}`, { method: "POST", headers: { "X-LF-Token": TOKEN } });
+    const data = await res.json();
+    if (!res.ok) toast(`${id}: ${data.error || "failed"}`);
+  } catch (e) { toast(`${id}: ${e}`); }
+  refresh();
+}
+
+$("new-task-open").addEventListener("click", () => openForm("new"));
+$("new-close").addEventListener("click", closeForm);
+$("new-cancel").addEventListener("click", closeForm);
+$("f-repeat").addEventListener("change", syncFormFields);
+newOverlay.addEventListener("click", (e) => { if (e.target === newOverlay) closeForm(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    closeForm();
+    logsOverlay.classList.remove("active");
+    setupOverlay.classList.remove("active");
+  }
+});
+// Cmd/Ctrl+Enter submits from the prompt box.
+$("f-prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) newForm.requestSubmit();
+});
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "X-LF-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return { ok: res.ok, data: await res.json() };
+}
+
+newForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  fError.textContent = "";
+  fSubmit.disabled = true;
+  const kind = formMode.kind;
+  const repeat = kind === "task" ? "once" : $("f-repeat").value;
+  const common = {
+    prompt: $("f-prompt").value,
+    repo: $("f-repo").value,
+    on_finish: $("f-finish").value,
+    agent: $("f-agent-wrap").hidden ? null : $("f-agent").value,
+  };
+  const cron = cronFor(repeat, $("f-time").value, $("f-day").value, $("f-cron").value);
+  try {
+    let path, body, done;
+    if (kind === "task") {
+      path = `/api/tasks/${encodeURIComponent(formMode.id)}/edit`;
+      body = { ...common, start: $("f-start").value };
+      done = () => `Saved ${formMode.id}`;
+    } else if (kind === "schedule") {
+      path = `/api/schedules/${encodeURIComponent(formMode.id)}/edit`;
+      body = { ...common, cron };
+      done = () => `Saved the schedule`;
+    } else if (repeat === "once") {
+      path = "/api/tasks";
+      body = { ...common, start: $("f-start").value };
+      done = (d) => `Queued ${d.id}`;
+    } else {
+      path = "/api/schedules";
+      body = { ...common, cron };
+      done = (d) => { showTab("schedules"); return `Scheduled ${d.id}`; };
+    }
+    const { ok, data } = await post(path, body);
+    if (!ok) {
+      fError.textContent = data.error || "couldn't save that";
+    } else {
+      if (kind === "new") draftPrompt = "";
+      newOverlay.classList.remove("active");
+      toast(done(data), true);
+      refresh();
+    }
+  } catch (err) {
+    fError.textContent = String(err);
+  }
+  fSubmit.disabled = false;
+});
+
 refresh();
+checkSetupQuietly();
 setInterval(refresh, 2000);
 </script>
 </body>
