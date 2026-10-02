@@ -192,3 +192,19 @@ breaking the page.
 See [docs/FORMAT.md](docs/FORMAT.md) for the file formats.
 
 See [TODO.md](TODO.md) for open work and ideas.
+
+## Testing
+
+```sh
+cargo test                  # unit tests, plus the CLI and runner tests in tests/
+                            # (they run the built `lf` against real git and tmux)
+
+cargo build                 # browser tests for the dashboard, in e2e/
+cd e2e && npm ci && npx playwright install chromium
+npm test                    # LF_BIN=path/to/lf to test another build
+```
+
+The browser tests start `lf start`/`lf web` for each test against a throwaway
+home, git repo and tmux server, with a stub agent that runs the prompt as a
+shell command, so they need `tmux` and `git` but no real coding agent and touch
+none of your files. CI runs both on every push and pull request.
