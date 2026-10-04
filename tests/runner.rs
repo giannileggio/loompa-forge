@@ -468,3 +468,194 @@ fn on_finish_pr_opens_a_pr_when_there_is_none() {
 fn on_finish_pr_does_not_open_a_second_pr_for_the_branch() {
     assert_eq!(finish_with_pr(true), 0);
 }
+
+/// A fake `gh` that is not authenticated: neither `pr view` nor `pr create`
+/// works. Returns the directory to put first on `$PATH`.
+fn fake_gh_unauthenticated(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nif [ \"$2\" = view ]; then exit 1; fi\n\
+         echo 'To get started with GitHub CLI, please run:  gh auth login' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[test]
+fn on_finish_pr_failure_keeps_the_work_and_says_how_to_finish_it() {
+    let env = Env::new("");
+    let origin = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+    git(
+        env.repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &origin.path().display().to_string(),
+        ],
+    );
+    let bin = fake_gh_unauthenticated(env.home.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    env.add(
+        "prfail",
+        "echo work > f.txt",
+        &["--on-finish", "pr", "--retries", "0"],
+    );
+
+    wait_for("prfail to be archived", Duration::from_secs(60), || {
+        ok(env
+            .lf()
+            .env("PATH", &path)
+            .args(["run", "--once"])
+            .output()
+            .unwrap());
+        env.archived("prfail")
+    });
+    assert_eq!(env.field("prfail", "status").as_deref(), Some("failed"));
+    let error = std::fs::read_to_string(env.home.path().join("archive/prfail.md")).unwrap();
+    assert!(error.contains("on_finish failed"), "{error}");
+    assert!(error.contains("gh auth login"), "{error}");
+    assert!(error.contains("lf/prfail"), "{error}");
+    assert!(error.contains("lf retry prfail"), "{error}");
+
+    // The commit `on_finish` made before `gh` failed is still there.
+    let wt = env.worktree("prfail");
+    assert_eq!(git(&wt, &["branch", "--show-current"]), "lf/prfail");
+    assert_eq!(
+        git(&wt, &["show", "--name-only", "--format=", "HEAD"]),
+        "f.txt"
+    );
+    assert!(
+        !git(env.repo.path(), &["branch", "--list", "lf/prfail"])
+            .trim()
+            .is_empty(),
+        "the branch is kept"
+    );
+}
+
+#[test]
+fn a_pane_that_dies_without_a_status_fails_with_an_explanation() {
+    let env = Env::new("");
+    // `$PPID` here is `lf exec`: killing it leaves a dead pane but no
+    // `logs/<id>.<attempt>.exit`, which is the production failure this
+    // reproduces.
+    env.add("selfkill", "kill -9 $PPID", &["--retries", "0"]);
+
+    assert_eq!(env.run_until_archived("selfkill"), "failed");
+    assert_eq!(env.field("selfkill", "attempts").as_deref(), Some("6"));
+    assert_eq!(env.field("selfkill", "interruptions").as_deref(), Some("5"));
+    let error = env.field("selfkill", "error").unwrap();
+    assert!(
+        error.contains("without recording an exit status"),
+        "{error}"
+    );
+    assert!(error.contains("interrupted 5 times"), "{error}");
+
+    for attempt in 1..=6 {
+        assert!(
+            !env.home
+                .path()
+                .join(format!("logs/selfkill.{attempt}.exit"))
+                .exists(),
+            "attempt {attempt} had no `.exit`, as in the production case"
+        );
+        let log =
+            std::fs::read_to_string(env.home.path().join(format!("logs/selfkill.{attempt}.log")))
+                .unwrap();
+        assert!(log.contains("attempt interrupted"), "{log}");
+    }
+}
+
+#[test]
+fn a_provider_error_fails_with_its_reason_and_is_not_retried() {
+    let env = Env::new("");
+    env.add(
+        "provider",
+        "printf '\\033[91m\\033[1mError: \\033[0mError from provider (Console): \
+         This model is not available in your country\\n' >&2; exit 1",
+        &["--retries", "2"],
+    );
+
+    assert_eq!(env.run_until_archived("provider"), "failed");
+    assert_eq!(
+        env.field("provider", "attempts").as_deref(),
+        Some("1"),
+        "the identical model was not retried"
+    );
+    assert_eq!(env.field("provider", "exit_code").as_deref(), Some("1"));
+    let error = env.field("provider", "error").unwrap();
+    assert!(error.contains("not available in your country"), "{error}");
+    assert!(error.contains("Retrying the same model"), "{error}");
+    assert!(error.contains("then run `lf retry provider`"), "{error}");
+    assert!(
+        !error.contains('\u{1b}'),
+        "terminal colours were stripped: {error}"
+    );
+}
+
+#[test]
+fn a_provider_error_with_exit_zero_is_not_treated_as_done() {
+    let env = Env::new("");
+    env.add(
+        "provider0",
+        "echo 'Error from provider (Console): This model is not available in your country'; \
+         exit 0",
+        &["--retries", "2"],
+    );
+
+    assert_eq!(env.run_until_archived("provider0"), "failed");
+    assert_eq!(env.field("provider0", "attempts").as_deref(), Some("1"));
+    assert_eq!(env.field("provider0", "exit_code").as_deref(), Some("0"));
+    let error = env.field("provider0", "error").unwrap();
+    assert!(error.contains("not available in your country"), "{error}");
+}
+
+#[test]
+fn a_task_whose_agent_binary_is_missing_fails_before_starting() {
+    let env = Env::new(
+        "[agents.missingbin]\nheadless = [\"lf-no-such-agent-binary\", \"{prompt}\"]\n\
+         interactive = [\"lf-no-such-agent-binary\", \"{prompt}\"]\n",
+    );
+    env.add(
+        "nobin",
+        "do work",
+        &["--agent", "missingbin", "--retries", "5"],
+    );
+
+    assert_eq!(env.run_until_archived("nobin"), "failed");
+    assert_eq!(
+        env.field("nobin", "attempts"),
+        None,
+        "no attempt was made, so no retry either"
+    );
+    let error = env.field("nobin", "error").unwrap();
+    assert!(error.contains("lf-no-such-agent-binary"), "{error}");
+    assert!(error.contains("not on $PATH"), "{error}");
+    assert!(error.contains("install it"), "{error}");
+}
+
+#[test]
+fn a_task_with_an_unconfigured_agent_fails_with_an_explanation() {
+    let env = Env::new("");
+    // `lf add` rejects this, but a task written by hand, an agent or a
+    // schedule can still name an agent that has no [agents.*] section.
+    std::fs::write(
+        env.home.path().join("tasks/ghost.md"),
+        format!(
+            "---\nid: ghost\nrepo: {}\nagent: nosuchagent\n---\n\nwork\n",
+            env.repo.path().display()
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(env.run_until_archived("ghost"), "failed");
+    let error = env.field("ghost", "error").unwrap();
+    assert!(error.contains("unknown agent `nosuchagent`"), "{error}");
+    assert!(error.contains("[agents.nosuchagent]"), "{error}");
+}

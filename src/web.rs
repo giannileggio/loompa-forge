@@ -824,6 +824,15 @@ mod tests {
         task.error = Some("exit code 1".into());
         assert_eq!(to_row(&task, &config).error.as_deref(), Some("exit code 1"));
 
+        // A provider/model failure reaches the dashboard with its reason.
+        task.error = Some("the agent's provider rejected the run: model is not available".into());
+        assert!(
+            to_row(&task, &config)
+                .error
+                .unwrap()
+                .contains("provider rejected the run")
+        );
+
         task.error = Some("  ".into());
         assert_eq!(to_row(&task, &config).error, None);
     }
