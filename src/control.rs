@@ -216,7 +216,7 @@ pub fn attach(home: &Home, id: Option<String>) -> Result<()> {
     let config = Config::load(&home.config_path())?;
     let Some(id) = id else {
         let session = &config.runner.tmux_session;
-        if !tmux::session_exists(session) {
+        if !tmux::session_exists(session)? {
             bail!("no tmux session `{session}`: nothing is running");
         }
         return Err(tmux::attach(session, None));
@@ -244,7 +244,7 @@ pub fn logs(home: &Home, id: &str, attempt: Option<u32>) -> Result<String> {
     }
     if task.status == Status::Running && attempt == task.attempts {
         let (session, window) = run::window_of(&task, &config);
-        if tmux::session_exists(&session) {
+        if tmux::session_exists(&session)? {
             return tmux::capture(&session, &window);
         }
     }

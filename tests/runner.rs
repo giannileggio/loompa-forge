@@ -492,6 +492,71 @@ fn on_finish_pr_does_not_open_a_second_pr_for_the_branch() {
     assert_eq!(finish_with_pr(true), 0);
 }
 
+/// A fake `tmux` that fails its first call with a transient error and
+/// delegates to the real one afterwards. Returns the directory to put
+/// first on `$PATH`.
+fn flaky_tmux(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let real = Command::new("sh")
+        .args(["-c", "command -v tmux"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap();
+    assert!(!real.is_empty(), "tmux is not on $PATH");
+    let tmux = bin.join("tmux");
+    std::fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\nmarker='{}'\nif [ ! -f \"$marker\" ]; then\n  : > \"$marker\"\n  \
+             echo 'tmux: transient failure' >&2\n  exit 1\nfi\nexec '{real}' \"$@\"\n",
+            dir.join("flaky-tmux-once").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// A tmux hiccup (a transient error, as opposed to the session being
+/// genuinely gone) must not be mistaken for a lost window: the healthy
+/// running task is left alone and the pass still succeeds.
+#[test]
+fn a_transient_tmux_error_does_not_requeue_a_running_task() {
+    let env = Env::new("");
+    env.add("steady", "sleep 300", &["--retries", "0"]);
+
+    env.tick();
+    assert_eq!(env.field("steady", "status").as_deref(), Some("running"));
+    assert_eq!(env.field("steady", "attempts").as_deref(), Some("1"));
+
+    let bin = flaky_tmux(env.home.path());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    ok(env
+        .lf()
+        .env("PATH", &path)
+        .args(["run", "--once"])
+        .output()
+        .unwrap());
+
+    assert_eq!(env.field("steady", "status").as_deref(), Some("running"));
+    assert_eq!(env.field("steady", "attempts").as_deref(), Some("1"));
+    assert_eq!(env.field("steady", "interruptions"), None);
+    assert!(!env.archived("steady"), "the healthy task was torn down");
+
+    let log = std::fs::read_to_string(env.home.path().join("runner.log")).unwrap();
+    assert!(log.contains("transient failure"), "{log}");
+
+    // The tmux error cleared: the window is still there and the queue
+    // goes on serving.
+    env.tick();
+    assert_eq!(env.field("steady", "status").as_deref(), Some("running"));
+    assert_eq!(env.field("steady", "attempts").as_deref(), Some("1"));
+
+    env.lf_ok(&["cancel", "steady"]);
+}
+
 // --- crash recovery ------------------------------------------------------------
 
 /// `lf run` killed outright (SIGKILL: no cleanup, no signal
@@ -537,6 +602,50 @@ fn a_killed_runner_leaves_no_task_stuck_running_or_running_twice() {
         1,
         "the agent ran exactly once: {runs:?}"
     );
+}
+
+/// A running `lf run` asked to stop (SIGTERM, as `lf stop` does) must not
+/// touch the task: it exits cleanly, the agent keeps going in its tmux
+/// window, and a fresh runner finishes it without a second attempt.
+#[test]
+fn sigterm_leaves_a_running_task_for_the_next_runner() {
+    let env = Env::new("");
+    env.add(
+        "longrun",
+        "echo ran >> runs.txt; sleep 5",
+        &["--retries", "0"],
+    );
+
+    let mut runner = env.runner();
+    wait_for("the task to start", Duration::from_secs(30), || {
+        env.field("longrun", "status").as_deref() == Some("running")
+    });
+
+    let pid = i32::try_from(runner.id()).unwrap();
+    // SAFETY: plain kill(2) on the child we spawned.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    wait_for("the runner to exit", Duration::from_secs(10), || {
+        runner.try_wait().unwrap().is_some()
+    });
+    let status = runner.wait().unwrap();
+    assert!(status.success(), "the runner exited badly: {status:?}");
+
+    // Untouched: still running, still the first attempt.
+    assert_eq!(env.field("longrun", "status").as_deref(), Some("running"));
+    assert_eq!(env.field("longrun", "attempts").as_deref(), Some("1"));
+
+    // A new runner finds the live window and lets it finish.
+    let mut runner = env.runner();
+    wait_for("longrun to be archived", Duration::from_secs(60), || {
+        env.archived("longrun")
+    });
+    runner.kill().unwrap();
+    runner.wait().unwrap();
+
+    assert_eq!(env.field("longrun", "status").as_deref(), Some("done"));
+    assert_eq!(env.field("longrun", "attempts").as_deref(), Some("1"));
+    let runs = std::fs::read_to_string(env.worktree("longrun").join("runs.txt")).unwrap();
+    assert_eq!(runs.lines().count(), 1, "the agent ran once: {runs:?}");
 }
 
 /// A running attempt whose exit record is unreadable (hand-edited

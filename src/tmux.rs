@@ -41,8 +41,38 @@ fn check(out: Output, what: &str) -> Result<Output> {
     Ok(out)
 }
 
-pub fn session_exists(session: &str) -> bool {
-    tmux(&["has-session", "-t", &format!("={session}")]).is_ok_and(|o| o.status.success())
+/// Whether `session` exists. `Ok(false)` means tmux says the session (or
+/// the whole server) is genuinely gone; `Err` means tmux itself failed
+/// (timed out, isn't installed, a transient error). Callers must not
+/// confuse the two, or a hiccup in tmux tears down healthy running tasks.
+pub fn session_exists(session: &str) -> Result<bool> {
+    let out = tmux(&["has-session", "-t", &format!("={session}")])?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if is_missing(&err) {
+        return Ok(false);
+    }
+    bail!("tmux has-session failed: {}", err.trim())
+}
+
+/// Whether tmux's message means the session or the whole server is gone,
+/// as opposed to a failure worth retrying on the next pass. Only tmux's own
+/// "no such session/server" wording qualifies; anything else (a wrapper
+/// exiting non-zero, a killed client, empty stderr) is an error.
+fn is_missing(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "can't find session",
+        "can't find window",
+        "no server running",
+        "no current session",
+        "session not found",
+        "error connecting to",
+        "lost server",
+    ];
+    let text = text.to_ascii_lowercase();
+    MARKERS.iter().any(|m| text.contains(m))
 }
 
 /// Starts `argv` in a new detached window named `window`. The window stays
@@ -53,7 +83,7 @@ pub fn spawn(session: &str, window: &str, workdir: &Path, argv: &[String]) -> Re
     let workdir = workdir.to_str().context("workdir is not valid UTF-8")?;
     let session_target = format!("={session}:");
     let window_target = format!("={session}:={window}");
-    let mut args = if session_exists(session) {
+    let mut args = if session_exists(session)? {
         vec!["new-window", "-d", "-t", &session_target]
     } else {
         vec!["new-session", "-d", "-s", session]
@@ -85,20 +115,26 @@ fn escape_arg(arg: &str) -> String {
 
 /// Every pane in `session`. A missing session yields no panes.
 pub fn panes(session: &str) -> Result<Vec<Pane>> {
-    if !session_exists(session) {
+    if !session_exists(session)? {
         return Ok(Vec::new());
     }
-    let out = check(
-        tmux(&[
-            "list-panes",
-            "-s",
-            "-t",
-            &format!("={session}"),
-            "-F",
-            "#{pane_dead} #{window_name}",
-        ])?,
+    let out = tmux(&[
         "list-panes",
-    )?;
+        "-s",
+        "-t",
+        &format!("={session}"),
+        "-F",
+        "#{pane_dead} #{window_name}",
+    ])?;
+    if !out.status.success() {
+        // The session can vanish between the two calls. Any other failure
+        // is transient and must reach the caller as an error.
+        let err = String::from_utf8_lossy(&out.stderr);
+        if is_missing(&err) {
+            return Ok(Vec::new());
+        }
+        bail!("tmux list-panes failed: {}", err.trim());
+    }
     Ok(parse_panes(&String::from_utf8_lossy(&out.stdout)))
 }
 
@@ -202,12 +238,12 @@ fn pane_pid(session: &str, window: &str) -> Option<i32> {
 /// depending on whether its socket directory exists, e.g. on a fresh boot,
 /// so asking first is more robust than matching error text.)
 pub fn kill_window(session: &str, window: &str) -> Result<()> {
-    if !session_exists(session) {
+    if !session_exists(session)? {
         return Ok(());
     }
     let out = tmux(&["kill-window", "-t", &format!("={session}:={window}")])?;
     let err = String::from_utf8_lossy(&out.stderr);
-    if out.status.success() || err.contains("can't find") || err.contains("no server") {
+    if out.status.success() || is_missing(&err) {
         Ok(())
     } else {
         bail!("tmux kill-window failed: {}", err.trim())
@@ -218,6 +254,18 @@ pub fn kill_window(session: &str, window: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn tells_a_missing_session_from_a_transient_failure() {
+        assert!(is_missing("can't find session: lft"));
+        assert!(is_missing("can't find window: lft"));
+        assert!(is_missing("no server running on /tmp/tmux-1000/default"));
+        assert!(is_missing(
+            "error connecting to /tmp/tmux-1000/default (No such file or directory)"
+        ));
+        assert!(!is_missing("tmux: transient failure"));
+        assert!(!is_missing(""));
+    }
 
     #[test]
     fn parses_list_panes_output() {
