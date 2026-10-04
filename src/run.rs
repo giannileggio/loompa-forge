@@ -525,7 +525,21 @@ fn poll_running(
         }
         let pane = panes[&session].iter().find(|p| p.window == window);
         let eff = task.spec.resolve(&config.defaults);
-        let exit = read_exit(&status_file(home, &task.id, task.attempts))?;
+        // A record that can't be read or parsed (hand-edited or
+        // corrupted) counts as no record yet: the attempt may still
+        // be running, and a dead pane without one is handled below.
+        // Failing the whole pass here would stall every task behind
+        // one bad file, forever.
+        let exit = match read_exit(&status_file(home, &task.id, task.attempts)) {
+            Ok(exit) => exit,
+            Err(e) => {
+                log(&format!(
+                    "{}: ignoring an unreadable exit record: {e:#}",
+                    task.id
+                ));
+                None
+            }
+        };
         if exit.is_some()
             && let Some(usage) = read_usage(&usage_file(home, &task.id, task.attempts))
         {
@@ -563,11 +577,14 @@ fn poll_running(
             save_log(home, &task, &session, &window);
             tmux::kill_window(&session, &window)?;
         }
-        // An agent can report a provider error (a rejected model, missing
-        // credentials) and still exit 0, so never let that count as done.
-        // Prefer the reason from the log over the bare exit code, and don't
-        // retry: the identical model would fail the same way.
-        if let Some(error) = provider_error(home, &task) {
+        // When an attempt failed, prefer a provider error found in its log
+        // (a rejected model, missing credentials) over the bare exit code,
+        // and don't retry: the identical model would fail the same way. Only
+        // failed attempts are scanned: a successful run's output may mention
+        // these phrases (e.g. while working on code that does).
+        if matches!(outcome, Outcome::Failed { .. })
+            && let Some(error) = provider_error(home, &task)
+        {
             outcome = Outcome::Failed {
                 error,
                 exit_code: exit_code_of(exit),

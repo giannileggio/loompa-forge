@@ -355,4 +355,27 @@ Fix the redirect loop.
         assert_eq!(fmt_cost(None), "-");
         assert_eq!(fmt_cost(Some(0.0512)), "$0.0512");
     }
+
+    /// A failed save (full disk, read-only folder) must leave the
+    /// task file exactly as it was: the atomic write fails before
+    /// the rename, so the old file survives intact. A directory
+    /// planted where the temp file would go fails the write the
+    /// same way a full disk does.
+    #[test]
+    fn a_failed_save_does_not_corrupt_the_task_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.md");
+        let task = Task::parse(SAMPLE).unwrap();
+        task.save(&path).unwrap();
+
+        let planted = fsutil::temp_path(&path);
+        std::fs::create_dir(&planted).unwrap();
+        let mut changed = task.clone();
+        changed.status = Status::Running;
+        assert!(changed.save(&path).is_err());
+
+        let saved = Task::load(&path).unwrap();
+        assert_eq!(saved, task);
+        std::fs::remove_dir(&planted).unwrap();
+    }
 }

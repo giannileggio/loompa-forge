@@ -15,6 +15,9 @@ struct Env {
     tmux: tempfile::TempDir,
 }
 
+/// The tmux session tasks run in (see the config `Env::new` writes).
+const SESSION: &str = "lft";
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
@@ -44,7 +47,7 @@ impl Env {
         std::fs::write(
             env.home.path().join("config.toml"),
             format!(
-                "[runner]\ntmux_session = \"lft\"\npoll_interval = \"1s\"\n{extra_config}\n\
+                "[runner]\ntmux_session = \"{SESSION}\"\npoll_interval = \"1s\"\n{extra_config}\n\
                  [defaults]\nagent = \"stub\"\nretry_delay = \"1s\"\n\n\
                  [agents.stub]\nheadless = [\"sh\", \"-c\", \"{{prompt}}\"]\n\
                  interactive = [\"sh\", \"-c\", \"{{prompt}}\"]\n"
@@ -135,6 +138,26 @@ impl Env {
             .env("TMUX_TMPDIR", self.tmux.path())
             .env_remove("TMUX")
             .output();
+    }
+
+    /// Kills the session tasks run in, leaving the server (and any
+    /// other sessions) alone.
+    fn tmux_kill_session(&self) {
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &format!("={SESSION}")])
+            .env("TMUX_TMPDIR", self.tmux.path())
+            .env_remove("TMUX")
+            .output();
+    }
+
+    /// Runs `lf run` in the background, like `lf start` does.
+    fn runner(&self) -> std::process::Child {
+        self.lf()
+            .arg("run")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
     }
 }
 
@@ -308,11 +331,11 @@ fn due_schedule(env: &Env, extra: &str) {
     .unwrap();
 }
 
-fn scheduled_tasks(env: &Env) -> usize {
+fn scheduled_tasks(env: &Env, schedule: &str) -> usize {
     std::fs::read_dir(env.home.path().join("tasks"))
         .unwrap()
         .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
-        .filter(|t| t.contains("created_by: schedule:tick"))
+        .filter(|t| t.contains(&format!("created_by: schedule:{schedule}")))
         .count()
 }
 
@@ -321,19 +344,19 @@ fn a_schedule_does_not_pile_up_runs_unless_allowed() {
     let env = Env::new("");
     due_schedule(&env, "");
     env.tick();
-    assert_eq!(scheduled_tasks(&env), 1);
+    assert_eq!(scheduled_tasks(&env, "tick"), 1);
 
     due_schedule(&env, ""); // another slot passed; the first run is still going
     env.tick();
     assert_eq!(
-        scheduled_tasks(&env),
+        scheduled_tasks(&env, "tick"),
         1,
         "skipped while the last run is queued"
     );
 
     due_schedule(&env, "allow_overlap: true\n");
     env.tick();
-    assert_eq!(scheduled_tasks(&env), 2);
+    assert_eq!(scheduled_tasks(&env, "tick"), 2);
 }
 
 #[test]
@@ -469,6 +492,253 @@ fn on_finish_pr_does_not_open_a_second_pr_for_the_branch() {
     assert_eq!(finish_with_pr(true), 0);
 }
 
+// --- crash recovery ------------------------------------------------------------
+
+/// `lf run` killed outright (SIGKILL: no cleanup, no signal
+/// handlers) while a task is running, then started again. The
+/// tmux server outlives the runner, so the agent keeps going:
+/// the new runner must let it finish, not start it again, and
+/// the task must end archived, not stuck `running`.
+#[test]
+fn a_killed_runner_leaves_no_task_stuck_running_or_running_twice() {
+    let env = Env::new("");
+    env.add(
+        "rescue",
+        "echo run >> runs.txt; sleep 5",
+        &["--retries", "0"],
+    );
+
+    let mut runner = env.runner();
+    wait_for("the task to start", Duration::from_secs(30), || {
+        env.field("rescue", "status").as_deref() == Some("running")
+    });
+
+    runner.kill().unwrap(); // SIGKILL, like an OOM kill or a crash
+    runner.wait().unwrap();
+
+    // A fresh process takes over the claim (the lock dies with
+    // the process) and picks the task back up.
+    let mut runner = env.runner();
+    wait_for("rescue to be archived", Duration::from_secs(60), || {
+        env.archived("rescue")
+    });
+    runner.kill().unwrap();
+    runner.wait().unwrap();
+
+    assert_eq!(env.field("rescue", "status").as_deref(), Some("done"));
+    assert_eq!(
+        env.field("rescue", "attempts").as_deref(),
+        Some("1"),
+        "the attempt must not be restarted"
+    );
+    let runs = std::fs::read_to_string(env.worktree("rescue").join("runs.txt")).unwrap();
+    assert_eq!(
+        runs.lines().count(),
+        1,
+        "the agent ran exactly once: {runs:?}"
+    );
+}
+
+/// A running attempt whose exit record is unreadable (hand-edited
+/// or corrupted) must not fail the pass: the task stays running
+/// while its window lives, and is requeued as an interruption once
+/// the window is gone.
+#[test]
+fn a_corrupt_exit_record_is_ignored_until_the_attempt_ends() {
+    let env = Env::new("");
+    env.add("stubborn", "sleep 300", &["--retries", "0"]);
+
+    env.tick();
+    assert_eq!(env.field("stubborn", "status").as_deref(), Some("running"));
+
+    std::fs::write(env.home.path().join("logs/stubborn.1.exit"), "garbage").unwrap();
+    env.tick(); // must not fail on the record
+    assert_eq!(env.field("stubborn", "status").as_deref(), Some("running"));
+    assert_eq!(env.field("stubborn", "attempts").as_deref(), Some("1"));
+
+    env.tmux_kill_server(); // the attempt is cut short
+    env.tick();
+    assert_eq!(
+        env.field("stubborn", "interruptions").as_deref(),
+        Some("1"),
+        "a lost window is an interruption, not a failure"
+    );
+
+    env.lf_ok(&["cancel", "stubborn"]);
+}
+
+/// Two `lf run` processes on one home: the second must refuse,
+/// and the first keeps serving.
+#[test]
+fn a_second_runner_process_refuses_to_start() {
+    let env = Env::new("");
+    let status = |env: &Env| String::from_utf8_lossy(&env.lf_ok(&["status"]).stdout).into_owned();
+
+    let mut runner = env.runner();
+    wait_for("the runner to show up", Duration::from_secs(10), || {
+        status(&env).contains("runner     running")
+    });
+
+    let second = env.lf().arg("run").output().unwrap();
+    assert!(!second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("already running"),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    // The first runner is unaffected, and still runs the queue.
+    env.add("served", "true", &[]);
+    wait_for("served to be archived", Duration::from_secs(60), || {
+        env.archived("served")
+    });
+    assert_eq!(env.field("served", "status").as_deref(), Some("done"));
+
+    runner.kill().unwrap();
+    runner.wait().unwrap();
+}
+
+/// Task and schedule files written non-atomically (or edited by
+/// hand) so their frontmatter is half-written: the runner skips
+/// and reports them, keeps them on disk, and still runs everything
+/// else.
+#[test]
+fn half_written_task_and_schedule_files_are_skipped_and_reported() {
+    let env = Env::new("");
+    // No closing frontmatter, mid-keyword: what a crash or an
+    // interrupted save leaves behind.
+    std::fs::write(
+        env.home.path().join("tasks/half-task.md"),
+        "---\nid: half-task\nrepo: ",
+    )
+    .unwrap();
+    std::fs::write(
+        env.home.path().join("schedules/half-schedule.md"),
+        "---\nid: half-schedule\ncron: ",
+    )
+    .unwrap();
+    // Complete frontmatter, but a field that isn't allowed.
+    std::fs::write(
+        env.home.path().join("tasks/typo.md"),
+        format!(
+            "---\nid: typo\nrepo: {}\nretrs: 1\n---\ntrue\n",
+            env.repo.path().display()
+        ),
+    )
+    .unwrap();
+    env.add("healthy", "true", &[]);
+
+    // Each pass is a fresh process, and none of them may crash,
+    // hang or fail because of the broken files.
+    wait_for("healthy to be archived", Duration::from_secs(60), || {
+        env.tick();
+        env.archived("healthy")
+    });
+    assert_eq!(env.field("healthy", "status").as_deref(), Some("done"));
+
+    for name in [
+        "tasks/half-task.md",
+        "schedules/half-schedule.md",
+        "tasks/typo.md",
+    ] {
+        assert!(env.home.path().join(name).exists(), "{name} was dropped");
+    }
+    let log = std::fs::read_to_string(env.home.path().join("runner.log")).unwrap();
+    for name in ["half-task", "half-schedule", "typo"] {
+        assert!(log.contains(name), "{name} was not reported:\n{log}");
+    }
+    assert!(!env.archived("half-task"));
+    assert!(!env.archived("typo"));
+}
+
+/// The tmux server survives, but the session the tasks run in is
+/// gone (killed by hand, or renamed away): the running tasks are
+/// requeued as interruptions, not left stuck `running`.
+#[test]
+fn losing_the_loompa_session_requeues_the_task() {
+    let env = Env::new("");
+    env.add("orphaned", "sleep 300", &["--retries", "0"]);
+
+    env.tick();
+    assert_eq!(env.field("orphaned", "status").as_deref(), Some("running"));
+
+    env.tmux_kill_session();
+    env.tick();
+    assert_eq!(env.field("orphaned", "status").as_deref(), Some("running"));
+    assert_eq!(
+        env.field("orphaned", "interruptions").as_deref(),
+        Some("1"),
+        "a lost session is an interruption"
+    );
+    assert_eq!(env.field("orphaned", "attempts").as_deref(), Some("2"));
+    assert!(
+        !env.archived("orphaned"),
+        "retries: 0, yet it wasn't failed"
+    );
+
+    env.lf_ok(&["cancel", "orphaned"]);
+}
+
+/// The `last_enqueued_at` slot of a schedule, for slot tests.
+fn last_enqueued(env: &Env, id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(env.home.path().join(format!("schedules/{id}.md"))).ok()?;
+    text.lines()
+        .skip(1)
+        .take_while(|l| *l != "---")
+        .find_map(|l| l.strip_prefix("last_enqueued_at: ").map(str::to_string))
+}
+
+/// A schedule whose slot is due must fire exactly once for it,
+/// even across restarts in the same minute: `last_enqueued_at` is
+/// recorded (atomically) before the task is created, so a fresh
+/// `lf run --once` in the same minute finds the slot already
+/// taken.
+#[test]
+fn a_schedule_does_not_fire_twice_for_the_same_slot_after_a_restart() {
+    use chrono::SubsecRound;
+
+    let env = Env::new("");
+    // Due: one minute ago, truncated to the second.
+    let due = (chrono::Local::now().fixed_offset() - chrono::Duration::minutes(1)).trunc_subsecs(0);
+    std::fs::write(
+        env.home.path().join("schedules/minute.md"),
+        format!(
+            "---\nid: minute\ncron: \"* * * * *\"\nrepo: {}\nretries: 0\n\
+             last_enqueued_at: {}\n---\n\nsleep 300\n",
+            env.repo.path().display(),
+            due.to_rfc3339()
+        ),
+    )
+    .unwrap();
+
+    // Each `run --once` is its own process: a restart.
+    env.tick();
+    assert_eq!(
+        scheduled_tasks(&env, "minute"),
+        1,
+        "the due slot fires once"
+    );
+    let first_slot = last_enqueued(&env, "minute");
+
+    env.tick();
+    let second_slot = last_enqueued(&env, "minute");
+    if second_slot == first_slot {
+        assert_eq!(
+            scheduled_tasks(&env, "minute"),
+            1,
+            "the same slot must not fire twice across restarts"
+        );
+    } else {
+        // The minute rolled over between the two runs: the new
+        // slot fires, exactly once.
+        assert_eq!(
+            scheduled_tasks(&env, "minute"),
+            2,
+            "a new minute fires exactly once"
+        );
+    }
+}
+
 /// A fake `gh` that is not authenticated: neither `pr view` nor `pr create`
 /// works. Returns the directory to put first on `$PATH`.
 fn fake_gh_unauthenticated(dir: &Path) -> PathBuf {
@@ -600,20 +870,17 @@ fn a_provider_error_fails_with_its_reason_and_is_not_retried() {
 }
 
 #[test]
-fn a_provider_error_with_exit_zero_is_not_treated_as_done() {
+fn a_successful_run_mentioning_a_provider_error_stays_done() {
+    // An agent working on code that handles these errors may print the
+    // phrase; only failed attempts are scanned for it.
     let env = Env::new("");
     env.add(
-        "provider0",
-        "echo 'Error from provider (Console): This model is not available in your country'; \
-         exit 0",
-        &["--retries", "2"],
+        "mentions",
+        "echo 'handled: Error from provider, model not found'; exit 0",
+        &[],
     );
 
-    assert_eq!(env.run_until_archived("provider0"), "failed");
-    assert_eq!(env.field("provider0", "attempts").as_deref(), Some("1"));
-    assert_eq!(env.field("provider0", "exit_code").as_deref(), Some("0"));
-    let error = env.field("provider0", "error").unwrap();
-    assert!(error.contains("not available in your country"), "{error}");
+    assert_eq!(env.run_until_archived("mentions"), "done");
 }
 
 #[test]
