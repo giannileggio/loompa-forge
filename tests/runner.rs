@@ -484,6 +484,15 @@ fn done_does_not_hold_the_home_lock_while_on_finish_runs() {
         "on_finish still running"
     );
 
+    // The window is gone but the task isn't done yet: a runner pass now
+    // must not mistake it for an interrupted run and requeue it.
+    env.tick();
+    assert_eq!(
+        env.field("pushy", "status").as_deref(),
+        Some("needs_review")
+    );
+    assert_eq!(env.field("pushy", "attempts").as_deref(), Some("1"));
+
     assert!(finishing.wait().unwrap().success());
     assert_eq!(env.field("pushy", "status").as_deref(), Some("done"));
     assert_eq!(

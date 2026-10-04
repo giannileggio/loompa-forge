@@ -121,16 +121,26 @@ pub fn stop_runner(home: &Home) -> Result<Option<u32>> {
 /// (ending their session), on `needs_review` ones, and on failed ones, e.g.
 /// after fixing whatever made `on_finish` fail.
 ///
-/// The home lock is held only to read the task and end its session, and
-/// again to archive: `on_finish` (a push or a PR) runs without it, so one
-/// that takes minutes can't stall the runner, the dashboard or `lf add`.
+/// The home lock is held to read the task and end its session, then released
+/// for `on_finish` (a push or a PR, which can take minutes) so it can't stall
+/// the runner, the dashboard or `lf add`; `run::complete` takes it again to
+/// archive. A `running` task is first marked `needs_review`: with its window
+/// gone, the runner would otherwise see it as interrupted and requeue it
+/// while `on_finish` is still going. If `lf done` dies midway the task is
+/// left `needs_review`, and `lf done` can simply be run again.
 pub fn done(home: &Home, id: Option<String>) -> Result<()> {
     let (config, id) = setup(home, id)?;
     let (path, task, deferred) = {
         let _lock = home.lock()?;
-        let (path, task) = find(home, &id)?;
+        let (path, mut task) = find(home, &id)?;
         let deferred = match task.status {
-            Status::Running => end_session(home, &config, &task)?,
+            Status::Running => {
+                let deferred = end_session(home, &config, &task)?;
+                task.status = Status::NeedsReview;
+                task.tmux_window = None;
+                task.save(&path)?;
+                deferred
+            }
             Status::NeedsReview | Status::Failed => None,
             s => bail!(
                 "`{id}` is {}; only running, needs_review or failed tasks can be marked done",

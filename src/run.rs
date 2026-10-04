@@ -56,8 +56,14 @@ pub fn install_shutdown_handler() {
     }
 }
 
+/// The first signal asks for a clean stop. A second one means the pass is
+/// stuck (e.g. a slow push) and the user wants out now: exit immediately
+/// (`_exit` is async-signal-safe). Running tasks live in tmux and survive.
 extern "C" fn on_shutdown(_signal: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::Relaxed);
+    if SHUTDOWN.swap(true, Ordering::Relaxed) {
+        // SAFETY: `_exit` is async-signal-safe and never returns.
+        unsafe { libc::_exit(130) }
+    }
 }
 
 /// Whether a stop has been requested (SIGTERM/SIGINT).
