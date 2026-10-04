@@ -430,18 +430,146 @@ fn a_slow_on_finish_does_not_block_other_commands() {
     );
 }
 
-/// A fake `gh` that records `pr create` calls; `pr view` succeeds or fails
-/// as given. Returns the directory to put first on `$PATH`.
-fn fake_gh(dir: &Path, pr_exists: bool) -> PathBuf {
+/// `lf done` runs `on_finish` (here: a push whose pre-push hook
+/// takes a while) without holding the home lock, so the runner,
+/// the dashboard and other commands aren't stalled behind it.
+#[test]
+fn done_does_not_hold_the_home_lock_while_on_finish_runs() {
+    let env = Env::new("");
+    // A bare "origin" whose pre-push hook takes a while stands in
+    // for a slow network.
+    let origin = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+    let repo = env.repo.path();
+    git(
+        repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &origin.path().display().to_string(),
+        ],
+    );
+    let hook = repo.join(".git/hooks/pre-push");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 8\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // The agent outlives the tick that starts it, so the task is
+    // still `running` afterwards and `lf done` — not the runner —
+    // runs its on_finish.
+    env.add(
+        "pushy",
+        "sleep 2; echo work > f.txt",
+        &["--on-finish", "push"],
+    );
+    env.add("bystander", "true", &["--in", "10h"]);
+
+    env.tick(); // starts it
+    wait_for("the agent to exit", Duration::from_secs(30), || {
+        env.home.path().join("logs/pushy.1.exit").exists()
+    });
+    let mut finishing = env.lf().args(["done", "pushy"]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(1500)); // now inside the hook
+
+    let started = Instant::now();
+    env.lf_ok(&["cancel", "bystander"]); // needs the home lock
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "blocked behind on_finish"
+    );
+    assert!(
+        finishing.try_wait().unwrap().is_none(),
+        "on_finish still running"
+    );
+
+    assert!(finishing.wait().unwrap().success());
+    assert_eq!(env.field("pushy", "status").as_deref(), Some("done"));
+    assert_eq!(
+        git(origin.path(), &["branch", "--list", "lf/pushy"]).trim(),
+        "lf/pushy"
+    );
+}
+
+/// `lf done` from inside the task's window defers the window kill
+/// until after `on_finish`; it must still happen when `on_finish`
+/// fails, so the window doesn't outlive the attempt.
+#[test]
+fn done_kills_the_window_even_when_on_finish_fails() {
+    let env = Env::new("");
+    // No "origin": the push in on_finish fails.
+    env.add(
+        "pushy",
+        "sleep 2; echo work > f.txt",
+        &["--on-finish", "push"],
+    );
+
+    env.tick(); // starts it
+    wait_for("the agent to exit", Duration::from_secs(30), || {
+        env.home.path().join("logs/pushy.1.exit").exists()
+    });
+    // LF_TASK_ID makes `lf done` believe it runs inside the
+    // task's window, so the kill waits until on_finish is over —
+    // and on_finish (the push) fails.
+    let out = env
+        .lf()
+        .env("LF_TASK_ID", "pushy")
+        .args(["done", "pushy"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(env.field("pushy", "status").as_deref(), Some("failed"));
+
+    // The window was killed even though on_finish failed.
+    let windows = Command::new("tmux")
+        .args(["list-windows", "-t", "=lft", "-F", "#{window_name}"])
+        .env("TMUX_TMPDIR", env.tmux.path())
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    let names = String::from_utf8_lossy(&windows.stdout);
+    assert!(
+        !names.lines().any(|w| w == "pushy"),
+        "the task's window outlived its failed on_finish: {names}"
+    );
+}
+
+/// What the fake `gh pr view` reports for the current branch.
+enum FakePr {
+    /// No PR for the branch (`gh pr view` fails).
+    None,
+    /// An open PR whose head is the branch's current commit.
+    AtHead,
+    /// An open PR for an older commit: a stale `lf/<id>`
+    /// branch from an earlier task.
+    AtOlderCommit,
+    /// A merged PR: closed, so it no longer covers the branch.
+    Merged,
+}
+
+/// A fake `gh` that answers `pr view` as `pr` says and records
+/// `pr create` calls. Returns the directory to put first on `$PATH`.
+fn fake_gh(dir: &Path, pr: FakePr) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
     let gh = bin.join("gh");
+    // `pr view` prints `<state> <headRefOid>` — the shape `gh
+    // pr view --json state,headRefOid --jq ...` prints — or fails
+    // when the branch has no PR at all.
+    let view = match pr {
+        FakePr::None => "exit 1".to_string(),
+        FakePr::AtHead => r#"echo "OPEN $(git rev-parse HEAD)""#.to_string(),
+        FakePr::AtOlderCommit => {
+            r##"echo "OPEN 0000000000000000000000000000000000000000""##.to_string()
+        }
+        FakePr::Merged => r#"echo "MERGED $(git rev-parse HEAD)""#.to_string(),
+    };
     std::fs::write(
         &gh,
         format!(
-            "#!/bin/sh\ncase \"$2\" in\n  view) exit {};;\n  create) echo created >> \"{}\";;\nesac\n",
-            if pr_exists { 0 } else { 1 },
+            "#!/bin/sh\ncase \"$2\" in\n  view) {view};;\n  create) echo created >> \"{}\";;\nesac\n",
             dir.join("gh-creates.log").display()
         ),
     )
@@ -450,7 +578,7 @@ fn fake_gh(dir: &Path, pr_exists: bool) -> PathBuf {
     bin
 }
 
-fn finish_with_pr(pr_exists: bool) -> usize {
+fn finish_with_pr(pr: FakePr) -> usize {
     let env = Env::new("");
     let origin = tempfile::tempdir().unwrap();
     git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
@@ -463,7 +591,7 @@ fn finish_with_pr(pr_exists: bool) -> usize {
             &origin.path().display().to_string(),
         ],
     );
-    let bin = fake_gh(env.home.path(), pr_exists);
+    let bin = fake_gh(env.home.path(), pr);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     env.add("prtask", "echo work > f.txt", &["--on-finish", "pr"]);
 
@@ -484,12 +612,25 @@ fn finish_with_pr(pr_exists: bool) -> usize {
 
 #[test]
 fn on_finish_pr_opens_a_pr_when_there_is_none() {
-    assert_eq!(finish_with_pr(false), 1);
+    assert_eq!(finish_with_pr(FakePr::None), 1);
 }
 
 #[test]
 fn on_finish_pr_does_not_open_a_second_pr_for_the_branch() {
-    assert_eq!(finish_with_pr(true), 0);
+    assert_eq!(finish_with_pr(FakePr::AtHead), 0);
+}
+
+/// A stale `lf/<id>` branch from an earlier task can have an open
+/// PR of its own, pointing at an older commit: that doesn't cover
+/// this run's work, so a PR is still opened.
+#[test]
+fn on_finish_pr_opens_a_pr_for_a_branch_pr_at_an_older_commit() {
+    assert_eq!(finish_with_pr(FakePr::AtOlderCommit), 1);
+}
+
+#[test]
+fn on_finish_pr_opens_a_pr_when_the_branch_pr_was_merged() {
+    assert_eq!(finish_with_pr(FakePr::Merged), 1);
 }
 
 // --- crash recovery ------------------------------------------------------------
