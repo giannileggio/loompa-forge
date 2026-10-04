@@ -139,6 +139,44 @@ pub fn remove_worktree(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Removes a worktree `git worktree remove` can't touch: one whose
+/// owning repo moved or was deleted, so its gitdir is unreachable
+/// and every git command in it fails — `lf clean` would keep it
+/// forever. `git worktree prune` clears any registration a
+/// surviving repo still holds (best effort: it fails like every
+/// other git command when the repo is gone), then the directory is
+/// removed directly.
+///
+/// Only a linked worktree root is removed this way: its `.git`
+/// is a file naming the (unreachable) gitdir, and `git rev-parse
+/// --show-toplevel` either fails (the repo is gone) or names the
+/// directory itself. A plain directory, a checkout of its own, or
+/// a subdirectory of a larger checkout is refused — removing any
+/// of those would delete unrelated work.
+pub fn remove_broken_worktree(path: &Path) -> Result<()> {
+    if !path.join(".git").is_file() {
+        bail!(
+            "{} is not a git worktree; remove it by hand",
+            path.display()
+        );
+    }
+    if let Ok(root) = repo_root(path)
+        && root != path
+    {
+        bail!(
+            "{} is part of the checkout at {}; remove it by hand",
+            path.display(),
+            root.display()
+        );
+    }
+    // Best effort: forget the worktree in a repo that is still
+    // reachable. When the repo is gone there is nothing left that
+    // references the worktree, and nothing to prune.
+    let _ = git(path, &["worktree", "prune"]);
+    std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
+    Ok(())
+}
+
 /// Whether `name` is a branch name git will actually accept, per
 /// `git check-ref-format`: no whitespace or control characters, no `..`,
 /// `~`, `^`, `:`, `?`, `*`, `[`, no `@{`, no leading/trailing/doubled `/`,
@@ -202,14 +240,12 @@ pub fn on_finish(action: OnFinish, dir: &Path, id: &str, prompt: &str) -> Result
     )?;
     if action == OnFinish::Pr {
         // The push may have worked on an earlier attempt whose `gh` call
-        // then failed: don't open a second PR for the same branch.
-        let existing = run(
-            "gh",
-            dir,
-            &["pr", "view", "--json", "url", "--jq", ".url"],
-            NETWORK_TIMEOUT,
-        );
-        if existing.is_ok() {
+        // then failed: don't open a second PR for the same branch. But a
+        // stale `lf/<id>` branch from an earlier task can still have a PR
+        // of its own — closed, or for an older commit — which `gh pr view`
+        // reports for this branch: only an open PR at this run's head
+        // commit counts as already opened.
+        if pr_covers_head(dir)? {
             return Ok(());
         }
         let (title, body) = message.split_once("\n\n").unwrap_or((&message, ""));
@@ -221,6 +257,37 @@ pub fn on_finish(action: OnFinish, dir: &Path, id: &str, prompt: &str) -> Result
         )?;
     }
     Ok(())
+}
+
+/// Whether the current branch already has an open PR whose head is the
+/// branch's current commit, so a second one must not be opened. `gh pr
+/// view` alone is not enough: it also succeeds for a stale `lf/<id>`
+/// branch from an earlier task, whose PR may be closed or point at an
+/// older commit — neither covers this run's work. `gh` failing to answer
+/// (e.g. no PR for the branch at all) counts as no covering PR; the
+/// `pr create` that follows then reports the real problem, if any.
+fn pr_covers_head(dir: &Path) -> Result<bool> {
+    let head = git(dir, &["rev-parse", "HEAD"])?;
+    let out = run(
+        "gh",
+        dir,
+        &[
+            "pr",
+            "view",
+            "--json",
+            "state,headRefOid",
+            "--jq",
+            "[.state, .headRefOid] | join(\" \")",
+        ],
+        NETWORK_TIMEOUT,
+    );
+    Ok(match out {
+        Ok(text) => {
+            let mut parts = text.trim().split(' ');
+            parts.next() == Some("OPEN") && parts.next() == Some(head.trim())
+        }
+        Err(_) => false,
+    })
 }
 
 #[cfg(test)]

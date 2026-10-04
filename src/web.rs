@@ -15,6 +15,8 @@
 use std::cmp::Reverse;
 use std::io::{IsTerminal, Read};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -25,7 +27,7 @@ use crate::config::{Config, on_path};
 use crate::control;
 use crate::edit::{self, ScheduleEdit, Start, TaskEdit};
 use crate::home::{Home, contract_tilde};
-use crate::run::RunnerState;
+use crate::run::{self, RunnerState};
 use crate::schedule::Schedule;
 use crate::spec::{OnFinish, TaskSpec};
 use crate::task::{Status, Task, fmt_cost, fmt_tokens, now};
@@ -107,6 +109,11 @@ fn bind(args: &WebArgs) -> Result<(Server, String)> {
 }
 
 fn run_server(home: &Home, server: Server, addr: &str, args: &WebArgs) -> Result<()> {
+    // Ctrl-C / SIGTERM request a clean stop: the signal handler only sets a
+    // flag, so the request loop is unblocked below instead of dying in the
+    // middle of a request.
+    run::install_shutdown_handler();
+    let server = Arc::new(server);
     let token = random_token()?;
     let cwd_repo = std::env::current_dir()
         .ok()
@@ -124,23 +131,56 @@ fn run_server(home: &Home, server: Server, addr: &str, args: &WebArgs) -> Result
         open_browser(&url);
     }
 
+    // Unblock every worker once the handler has seen a signal (`unblock`
+    // wakes one blocked thread per call).
+    let unblocker = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            while !run::shutdown_requested() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            for _ in 0..WORKERS {
+                server.unblock();
+            }
+        })
+    };
+    let ctx = &ctx;
+
     std::thread::scope(|scope| {
         for _ in 0..WORKERS {
-            scope.spawn(|| {
+            let server = Arc::clone(&server);
+            scope.spawn(move || {
                 for request in server.incoming_requests() {
-                    handle(&ctx, request);
+                    handle(ctx, request);
                 }
             });
         }
     });
+    let _ = unblocker.join();
+    println!("Stopping the dashboard (running tasks keep going in their tmux windows).");
     Ok(())
 }
 
-/// A background `lf run`, killed when dropped.
+/// A background `lf run`, stopped when dropped. It's asked to stop
+/// (SIGTERM) so it can finish its current pass first; only a runner that
+/// doesn't go is killed.
 struct RunnerChild(Child);
 
 impl Drop for RunnerChild {
     fn drop(&mut self) {
+        // SAFETY: plain kill(2) on the child we spawned.
+        let asked = i32::try_from(self.0.id())
+            .map(|pid| unsafe { libc::kill(pid, libc::SIGTERM) } == 0)
+            .unwrap_or(false);
+        if asked {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if self.0.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }

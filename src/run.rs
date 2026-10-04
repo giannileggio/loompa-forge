@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, Local};
 use serde::{Deserialize, Serialize};
 
@@ -37,9 +37,44 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// can't loop forever.
 const MAX_INTERRUPTIONS: u32 = 5;
 
+/// Set from the SIGTERM/SIGINT handler (see [`install_shutdown_handler`]).
+/// The runner checks it between passes, so a signal can't tear down a
+/// half-finished tick or the tmux windows running tasks live in.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Turns SIGTERM/SIGINT into a request to stop after the current pass.
+/// Without it the process dies mid-tick, which can leave a task file
+/// written but not yet archived. Running tasks keep going in their tmux
+/// windows either way; the next `lf run` picks them up.
+pub fn install_shutdown_handler() {
+    // SAFETY: `on_shutdown` only stores to an atomic, which is
+    // async-signal-safe; the previous disposition was the default.
+    unsafe {
+        let handler = on_shutdown as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
+
+/// The first signal asks for a clean stop. A second one means the pass is
+/// stuck (e.g. a slow push) and the user wants out now: exit immediately
+/// (`_exit` is async-signal-safe). Running tasks live in tmux and survive.
+extern "C" fn on_shutdown(_signal: libc::c_int) {
+    if SHUTDOWN.swap(true, Ordering::Relaxed) {
+        // SAFETY: `_exit` is async-signal-safe and never returns.
+        unsafe { libc::_exit(130) }
+    }
+}
+
+/// Whether a stop has been requested (SIGTERM/SIGINT).
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
+
 pub fn run(home: &Home, once: bool) -> Result<()> {
     home.ensure_initialized()?;
     let _runner = home.claim_runner()?;
+    install_shutdown_handler();
     let _ = LOG_FILE.set(home.runner_log());
     let mut config = Config::load(&home.config_path())?;
     let mut state = RunnerState {
@@ -71,12 +106,33 @@ pub fn run(home: &Home, once: bool) -> Result<()> {
         if once {
             return Ok(());
         }
-        std::thread::sleep(config.runner.poll_interval);
+        if !sleep_until_tick(config.runner.poll_interval) {
+            log(
+                "stopping on request: running tasks keep going in their tmux windows; \
+                 `lf run` will pick them up again",
+            );
+            return Ok(());
+        }
         match Config::load(&home.config_path()) {
             Ok(c) => config = c,
             Err(e) => log(&format!("keeping the previous config: {e:#}")),
         }
     }
+}
+
+/// Sleeps up to `duration`, returning `false` as soon as a stop is
+/// requested. Short slices keep a long poll interval from delaying a
+/// signal-driven stop.
+fn sleep_until_tick(duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if shutdown_requested() {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+    !shutdown_requested()
 }
 
 /// The runner's heartbeat, in `runner.json`: lets `lf status` tell a live
@@ -516,14 +572,27 @@ fn poll_running(
     config: &Config,
     now: DateTime<FixedOffset>,
 ) -> Result<Vec<(PathBuf, Task)>> {
-    let mut panes: HashMap<String, Vec<tmux::Pane>> = HashMap::new();
+    let mut panes: HashMap<String, Option<Vec<tmux::Pane>>> = HashMap::new();
     let mut succeeded = Vec::new();
     for (path, mut task) in load_tasks(home, Status::Running)? {
         let (session, window) = window_of(&task, config);
-        if !panes.contains_key(&session) {
-            panes.insert(session.clone(), tmux::panes(&session)?);
-        }
-        let pane = panes[&session].iter().find(|p| p.window == window);
+        // A tmux failure (timeout, a transient error) is not evidence that
+        // the window is gone: leave the session's tasks untouched and retry
+        // on the next pass, instead of requeueing healthy runs.
+        let session_panes = panes.entry(session.clone()).or_insert_with(|| {
+            tmux::panes(&session)
+                .map_err(|e| {
+                    log(&format!(
+                        "{session}: could not list its tmux windows ({e:#}); leaving its \
+                         running tasks alone until the next pass"
+                    ));
+                })
+                .ok()
+        });
+        let Some(session_panes) = session_panes else {
+            continue;
+        };
+        let pane = session_panes.iter().find(|p| p.window == window);
         let eff = task.spec.resolve(&config.defaults);
         // A record that can't be read or parsed (hand-edited or
         // corrupted) counts as no record yet: the attempt may still
@@ -575,7 +644,16 @@ fn poll_running(
                 tmux::stop_processes(&session, &window, STOP_GRACE);
             }
             save_log(home, &task, &session, &window);
-            tmux::kill_window(&session, &window)?;
+            // If tmux fails here the task's file hasn't been touched, so
+            // leaving it running lets the next pass close the window and
+            // record the outcome.
+            if let Err(e) = tmux::kill_window(&session, &window) {
+                log(&format!(
+                    "{}: could not close its tmux window ({e:#}); retrying on the next pass",
+                    task.id
+                ));
+                continue;
+            }
         }
         // When an attempt failed, prefer a provider error found in its log
         // (a rejected model, missing credentials) over the bare exit code,
@@ -833,19 +911,47 @@ fn finalize(home: &Home, config: &Config, path: &Path, mut task: Task) -> Result
 }
 
 /// Runs `on_finish` and archives the task as done, or as failed if
-/// `on_finish` fails. Returns the final status. The caller holds the home
-/// lock throughout (see [`finalize`] for the runner's lock-free variant).
+/// `on_finish` fails — the task is still archived (as failed, with the
+/// details in its file) and an error is returned. Returns the final
+/// status (`Done`).
+///
+/// `on_finish` runs without the home lock — a push or a PR can take
+/// minutes and must not stall the runner or other commands — so the
+/// lock is taken only to archive, and only if the task is still as it
+/// was (not cancelled, retried or finished by hand meanwhile). The
+/// runner's own equivalent is [`finalize`].
 pub fn complete(
     home: &Home,
     config: &Config,
     path: &Path,
-    mut task: Task,
+    task: Task,
     now: DateTime<FixedOffset>,
 ) -> Result<Status> {
     let result = run_on_finish(home, config, &task);
+    let _lock = home.lock()?;
+    match Task::load(path) {
+        Ok(current) if current.status == task.status && current.attempts == task.attempts => {}
+        Ok(current) => {
+            log(&format!(
+                "{} changed to {} while on_finish ran; leaving it as it is",
+                task.id,
+                current.status.as_str()
+            ));
+            bail!(
+                "{} became {} while its on_finish ran, so it was not marked done",
+                task.id,
+                current.status.as_str()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("re-reading {}", path.display())),
+    }
+    let mut task = task;
     record_finish(home, config, &mut task, result);
     let status = task.status;
     archive(home, path, task, now)?;
+    if status != Status::Done {
+        bail!("on_finish failed; the work is still in the task's worktree or repo");
+    }
     Ok(status)
 }
 
