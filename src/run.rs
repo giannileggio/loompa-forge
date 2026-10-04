@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, Local};
 use serde::{Deserialize, Serialize};
 
@@ -905,19 +905,47 @@ fn finalize(home: &Home, config: &Config, path: &Path, mut task: Task) -> Result
 }
 
 /// Runs `on_finish` and archives the task as done, or as failed if
-/// `on_finish` fails. Returns the final status. The caller holds the home
-/// lock throughout (see [`finalize`] for the runner's lock-free variant).
+/// `on_finish` fails — the task is still archived (as failed, with the
+/// details in its file) and an error is returned. Returns the final
+/// status (`Done`).
+///
+/// `on_finish` runs without the home lock — a push or a PR can take
+/// minutes and must not stall the runner or other commands — so the
+/// lock is taken only to archive, and only if the task is still as it
+/// was (not cancelled, retried or finished by hand meanwhile). The
+/// runner's own equivalent is [`finalize`].
 pub fn complete(
     home: &Home,
     config: &Config,
     path: &Path,
-    mut task: Task,
+    task: Task,
     now: DateTime<FixedOffset>,
 ) -> Result<Status> {
     let result = run_on_finish(home, config, &task);
+    let _lock = home.lock()?;
+    match Task::load(path) {
+        Ok(current) if current.status == task.status && current.attempts == task.attempts => {}
+        Ok(current) => {
+            log(&format!(
+                "{} changed to {} while on_finish ran; leaving it as it is",
+                task.id,
+                current.status.as_str()
+            ));
+            bail!(
+                "{} became {} while its on_finish ran, so it was not marked done",
+                task.id,
+                current.status.as_str()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("re-reading {}", path.display())),
+    }
+    let mut task = task;
     record_finish(home, config, &mut task, result);
     let status = task.status;
     archive(home, path, task, now)?;
+    if status != Status::Done {
+        bail!("on_finish failed; the work is still in the task's worktree or repo");
+    }
     Ok(status)
 }
 

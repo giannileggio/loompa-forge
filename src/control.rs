@@ -120,24 +120,32 @@ pub fn stop_runner(home: &Home) -> Result<Option<u32>> {
 /// Runs `on_finish` and archives the task as done. Works on running tasks
 /// (ending their session), on `needs_review` ones, and on failed ones, e.g.
 /// after fixing whatever made `on_finish` fail.
+///
+/// The home lock is held only to read the task and end its session, and
+/// again to archive: `on_finish` (a push or a PR) runs without it, so one
+/// that takes minutes can't stall the runner, the dashboard or `lf add`.
 pub fn done(home: &Home, id: Option<String>) -> Result<()> {
     let (config, id) = setup(home, id)?;
-    let lock = home.lock()?;
-    let (path, task) = find(home, &id)?;
-    let deferred = match task.status {
-        Status::Running => end_session(home, &config, &task)?,
-        Status::NeedsReview | Status::Failed => None,
-        s => bail!(
-            "`{id}` is {}; only running, needs_review or failed tasks can be marked done",
-            s.as_str()
-        ),
+    let (path, task, deferred) = {
+        let _lock = home.lock()?;
+        let (path, task) = find(home, &id)?;
+        let deferred = match task.status {
+            Status::Running => end_session(home, &config, &task)?,
+            Status::NeedsReview | Status::Failed => None,
+            s => bail!(
+                "`{id}` is {}; only running, needs_review or failed tasks can be marked done",
+                s.as_str()
+            ),
+        };
+        (path, task, deferred)
     };
-    let status = run::complete(home, &config, &path, task, now())?;
-    drop(lock);
-    kill_deferred(deferred)?;
-    if status != Status::Done {
-        bail!("on_finish failed; the work is still in the task's worktree or repo");
-    }
+    let finished = run::complete(home, &config, &path, task, now());
+    // From inside the task's window the kill waits until `on_finish` is
+    // over, and must happen even if that (or the archiving) failed: a
+    // failure there must not leave the window running.
+    let killed = kill_deferred(deferred);
+    finished?;
+    killed?;
     Ok(())
 }
 

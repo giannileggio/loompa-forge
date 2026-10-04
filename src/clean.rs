@@ -77,10 +77,19 @@ pub fn clean(home: &Home, args: CleanArgs) -> Result<()> {
                     removed += 1;
                     println!("removed  {id}");
                 }
-                Err(e) => {
-                    kept += 1;
-                    println!("kept     {id}: {e:#}");
-                }
+                // A worktree whose owning repo moved or was deleted
+                // can't be removed by git at all, so it would stay
+                // "kept" forever.
+                Err(_) => match git::remove_broken_worktree(&dir) {
+                    Ok(()) => {
+                        removed += 1;
+                        println!("removed  {id} (broken worktree)");
+                    }
+                    Err(e) => {
+                        kept += 1;
+                        println!("kept     {id}: {e:#}");
+                    }
+                },
             },
         }
     }
@@ -234,11 +243,15 @@ fn eligible(
     Ok(())
 }
 
+/// Whether `dir` has uncommitted changes, which `lf clean` always
+/// keeps. A directory git can't inspect — a worktree whose owning
+/// repo moved or was deleted — is not reported as dirty: the
+/// removal attempt decides what to do with it (see
+/// [`git::remove_broken_worktree`]).
 fn check_clean(dir: &Path) -> Result<(), String> {
     match git::has_changes(dir) {
-        Ok(false) => Ok(()),
         Ok(true) => Err("has uncommitted changes".into()),
-        Err(e) => Err(format!("{e:#}")),
+        _ => Ok(()),
     }
 }
 
@@ -396,6 +409,152 @@ mod tests {
         assert!(
             home.worktrees().join("bad").exists(),
             "its worktree is kept too"
+        );
+    }
+
+    // --- worktrees ---------------------------------------------------------
+
+    use std::path::PathBuf;
+
+    /// Runs git in `dir`, asserting it succeeds.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("running git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A real git repo with one commit.
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        ] {
+            git(dir.path(), args);
+        }
+        dir
+    }
+
+    /// A real worktree of `repo` at `home/worktrees/<id>`, like
+    /// the one a finished task leaves behind.
+    fn worktree(home: &Home, repo: &Path, id: &str) -> PathBuf {
+        let dir = home.worktrees().join(id);
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                dir.to_str().unwrap(),
+                "-b",
+                &format!("lf/{id}"),
+            ],
+        );
+        dir
+    }
+
+    fn clean_args(all: bool, older_than: Option<Duration>) -> CleanArgs {
+        CleanArgs {
+            all,
+            older_than,
+            archive: false,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn clean_keeps_a_worktree_with_uncommitted_changes() {
+        let (_d, home) = home();
+        let repo = git_repo();
+        archive(&home, "dirty", Status::Done, Some(now()));
+        let wt = worktree(&home, repo.path(), "dirty");
+        std::fs::write(wt.join("wip.txt"), "unfinished").unwrap();
+
+        clean(&home, clean_args(false, None)).unwrap();
+
+        assert!(wt.exists(), "a dirty worktree is kept");
+        assert!(home.archive().join("dirty.md").exists());
+    }
+
+    #[test]
+    fn clean_older_than_only_removes_old_enough_worktrees() {
+        let (_d, home) = home();
+        let repo = git_repo();
+        let week = Duration::from_secs(7 * 86400);
+        archive(&home, "fresh", Status::Done, Some(now()));
+        archive(
+            &home,
+            "stale",
+            Status::Done,
+            Some(now() - chrono::Duration::days(8)),
+        );
+        let fresh = worktree(&home, repo.path(), "fresh");
+        let stale = worktree(&home, repo.path(), "stale");
+
+        clean(&home, clean_args(false, Some(week))).unwrap();
+
+        assert!(fresh.exists(), "finished too recently");
+        assert!(!stale.exists(), "finished before the cutoff");
+    }
+
+    #[test]
+    fn clean_handles_a_worktree_with_no_task_file() {
+        let (_d, home) = home();
+        let repo = git_repo();
+        let orphan = worktree(&home, repo.path(), "orphan");
+
+        clean(&home, clean_args(false, None)).unwrap();
+        assert!(orphan.exists(), "kept without --all: no task file");
+
+        clean(&home, clean_args(true, None)).unwrap();
+        assert!(!orphan.exists(), "an orphan worktree is cleaned with --all");
+    }
+
+    #[test]
+    fn clean_removes_a_worktree_whose_repo_was_deleted() {
+        let (_d, home) = home();
+        let repo = git_repo();
+        archive(&home, "deleted", Status::Done, Some(now()));
+        let broken = worktree(&home, repo.path(), "deleted");
+        // The owning repo is gone: no git command works in the
+        // worktree, so it would stay "kept" forever.
+        drop(repo);
+
+        clean(&home, clean_args(false, None)).unwrap();
+
+        assert!(
+            !broken.exists(),
+            "a worktree whose repo is gone is removed, not kept"
+        );
+    }
+
+    #[test]
+    fn clean_removes_a_worktree_whose_repo_moved() {
+        let (_d, home) = home();
+        let repo = git_repo();
+        archive(&home, "moved", Status::Done, Some(now()));
+        let broken = worktree(&home, repo.path(), "moved");
+        // The owning repo moved away, like a relocated project:
+        // the worktree's gitdir points at a path that is no
+        // longer a repository.
+        let new_repo = tempfile::tempdir().unwrap();
+        std::fs::rename(repo.path(), new_repo.path()).unwrap();
+
+        clean(&home, clean_args(false, None)).unwrap();
+
+        assert!(
+            !broken.exists(),
+            "a worktree whose repo moved is removed, not kept"
         );
     }
 }
