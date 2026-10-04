@@ -498,6 +498,9 @@ enum Outcome {
     Failed {
         error: String,
         exit_code: Option<i32>,
+        /// Whether a retry could plausibly help. A provider rejecting the
+        /// model won't change on a retry, so those failures skip it.
+        retry: bool,
     },
     /// An interactive session ended without `lf done` / `lf fail`.
     NeedsReview,
@@ -522,21 +525,38 @@ fn poll_running(
         }
         let pane = panes[&session].iter().find(|p| p.window == window);
         let eff = task.spec.resolve(&config.defaults);
-        let exit = read_exit(&status_file(home, &task.id, task.attempts))?;
+        // A record that can't be read or parsed (hand-edited or
+        // corrupted) counts as no record yet: the attempt may still
+        // be running, and a dead pane without one is handled below.
+        // Failing the whole pass here would stall every task behind
+        // one bad file, forever.
+        let exit = match read_exit(&status_file(home, &task.id, task.attempts)) {
+            Ok(exit) => exit,
+            Err(e) => {
+                log(&format!(
+                    "{}: ignoring an unreadable exit record: {e:#}",
+                    task.id
+                ));
+                None
+            }
+        };
         if exit.is_some()
             && let Some(usage) = read_usage(&usage_file(home, &task.id, task.attempts))
         {
             task.add_usage(usage.tokens_in, usage.tokens_out, usage.cost_usd);
         }
         let mut stop_agent = false;
-        let outcome = match (exit, pane) {
+        let mut outcome = match (exit, pane) {
             (Some(exit), _) => exit_outcome(eff.mode, exit),
             (None, None) => Outcome::Interrupted("tmux window disappeared".into()),
             // `lf exec` writes the status before exiting, so a dead pane
-            // without one means `lf exec` itself was killed.
-            (None, Some(p)) if p.dead => {
-                Outcome::Interrupted("the agent's window was killed".into())
-            }
+            // without one means `lf exec` itself was killed (or the agent
+            // killed its own process group) before it could record it.
+            (None, Some(p)) if p.dead => Outcome::Interrupted(
+                "the window died without recording an exit status (`lf exec` was killed or \
+                 the agent crashed before it could write one)"
+                    .into(),
+            ),
             (None, Some(_)) if eff.mode == Mode::Headless && timed_out(&task, &eff, now) => {
                 stop_agent = true;
                 Outcome::Failed {
@@ -545,6 +565,7 @@ fn poll_running(
                         humantime::format_duration(eff.timeout)
                     ),
                     exit_code: None,
+                    retry: true,
                 }
             }
             (None, Some(_)) => continue,
@@ -555,6 +576,20 @@ fn poll_running(
             }
             save_log(home, &task, &session, &window);
             tmux::kill_window(&session, &window)?;
+        }
+        // When an attempt failed, prefer a provider error found in its log
+        // (a rejected model, missing credentials) over the bare exit code,
+        // and don't retry: the identical model would fail the same way. Only
+        // failed attempts are scanned: a successful run's output may mention
+        // these phrases (e.g. while working on code that does).
+        if matches!(outcome, Outcome::Failed { .. })
+            && let Some(error) = provider_error(home, &task)
+        {
+            outcome = Outcome::Failed {
+                error,
+                exit_code: exit_code_of(exit),
+                retry: false,
+            };
         }
         match outcome {
             Outcome::Succeeded(code) => {
@@ -571,6 +606,119 @@ fn poll_running(
     Ok(succeeded)
 }
 
+fn exit_code_of(exit: Option<Exit>) -> Option<i32> {
+    match exit {
+        Some(Exit::Code(code)) => Some(code),
+        _ => None,
+    }
+}
+
+/// A provider- or model-level error the agent reported, as an actionable
+/// message. `None` if the attempt's log has no such line (or there is no log).
+fn provider_error(home: &Home, task: &Task) -> Option<String> {
+    let path = log_file(home, &task.id, task.attempts);
+    let line = provider_error_line(&read_log_tail(&path)?)?;
+    Some(format!(
+        "the agent's provider rejected the run: {line}. Retrying the same model would fail \
+         the same way, so it wasn't retried: fix the provider or set a different `model`, \
+         then run `lf retry {id}`",
+        id = task.id
+    ))
+}
+
+/// Signatures of an error only the provider/model can explain, e.g.
+/// `Error from provider (Console): This model is not available in your
+/// country`. Matched case-insensitively against each line of the agent's
+/// output.
+const PROVIDER_ERROR_MARKERS: &[&str] = &[
+    "error from provider",
+    "model is not available",
+    "not available in your country",
+    "invalid_api_key",
+    "invalid api key",
+    "incorrect api key",
+    "authentication_error",
+    "insufficient_quota",
+    "insufficient quota",
+    "model not found",
+    "unknown model",
+    "no such model",
+];
+
+/// The first provider-error line in `text`, with terminal escapes removed.
+fn provider_error_line(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let line = strip_ansi(line);
+        let lower = line.to_ascii_lowercase();
+        PROVIDER_ERROR_MARKERS
+            .iter()
+            .any(|m| lower.contains(m))
+            .then(|| line.trim().to_string())
+    })
+}
+
+/// Removes ANSI CSI/OSC escape sequences, so error messages taken from an
+/// agent's (coloured) output stay readable in the task file and dashboard.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The last part of an attempt's log: enough to find a provider error
+/// without reading a whole (possibly huge) file into memory.
+fn read_log_tail(path: &Path) -> Option<String> {
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > TAIL_BYTES {
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(len - TAIL_BYTES)).ok()?;
+    }
+    let mut buf = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Appends a runner note to the attempt's log, so the pane capture alone
+/// ("Pane is dead (status 1 ...)") isn't the only explanation of how the
+/// attempt ended.
+fn note_in_log(home: &Home, task: &Task, note: &str) {
+    let path = log_file(home, &task.id, task.attempts);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "\n[lf] {note}");
+}
+
 fn exit_outcome(mode: Mode, exit: Exit) -> Outcome {
     match (mode, exit) {
         (Mode::Interactive, _) => Outcome::NeedsReview,
@@ -578,10 +726,12 @@ fn exit_outcome(mode: Mode, exit: Exit) -> Outcome {
         (Mode::Headless, Exit::Code(n)) => Outcome::Failed {
             error: format!("exited with status {n}"),
             exit_code: Some(n),
+            retry: true,
         },
         (Mode::Headless, Exit::Signal(s)) => Outcome::Failed {
             error: format!("killed by signal {s}"),
             exit_code: None,
+            retry: true,
         },
     }
 }
@@ -637,6 +787,7 @@ fn finish(
             task.scheduled_at = None;
             task.tmux_window = None;
             task.error = None;
+            note_in_log(home, &task, &format!("attempt interrupted: {reason}"));
             log(&format!(
                 "{} was interrupted (attempt {}): {reason}; requeueing without using a retry",
                 task.id, task.attempts
@@ -645,11 +796,16 @@ fn finish(
         }
         Outcome::Interrupted(reason) => {
             let error = format!("{reason} (interrupted {MAX_INTERRUPTIONS} times)");
-            fail_attempt(home, path, task, &eff, error, now)
+            note_in_log(home, &task, &format!("attempt interrupted: {reason}"));
+            fail_attempt(home, path, task, &eff, error, true, now)
         }
-        Outcome::Failed { error, exit_code } => {
+        Outcome::Failed {
+            error,
+            exit_code,
+            retry,
+        } => {
             task.exit_code = exit_code;
-            fail_attempt(home, path, task, &eff, error, now)
+            fail_attempt(home, path, task, &eff, error, retry, now)
         }
     }
 }
@@ -672,7 +828,7 @@ fn finalize(home: &Home, config: &Config, path: &Path, mut task: Task) -> Result
             return Ok(());
         }
     }
-    record_finish(&mut task, result);
+    record_finish(home, config, &mut task, result);
     archive(home, path, task, now())
 }
 
@@ -687,7 +843,7 @@ pub fn complete(
     now: DateTime<FixedOffset>,
 ) -> Result<Status> {
     let result = run_on_finish(home, config, &task);
-    record_finish(&mut task, result);
+    record_finish(home, config, &mut task, result);
     let status = task.status;
     archive(home, path, task, now)?;
     Ok(status)
@@ -699,35 +855,51 @@ fn run_on_finish(home: &Home, config: &Config, task: &Task) -> Result<()> {
     git::on_finish(eff.on_finish, &dir, &task.id, &task.prompt)
 }
 
-fn record_finish(task: &mut Task, on_finish: Result<()>) {
+fn record_finish(home: &Home, config: &Config, task: &mut Task, on_finish: Result<()>) {
     match on_finish {
         Ok(()) => {
             task.status = Status::Done;
             task.error = None;
         }
         Err(e) => {
+            // `on_finish` commits before pushing or opening a PR, so a
+            // failure here usually leaves the agent's work on the task's
+            // branch: say where it is and how to pick it up again.
+            let eff = task.spec.resolve(&config.defaults);
+            let dir = workdir(home, task, &eff);
+            let branch = task.effective_branch(config).unwrap_or_else(|| "-".into());
             task.status = Status::Failed;
-            task.error = Some(format!("on_finish failed: {e:#}"));
+            task.error = Some(format!(
+                "on_finish failed: {e:#}\nThe worktree is kept at {} and the work is on branch `{branch}` \
+                 (commit `on_finish` made, plus anything uncommitted). Fix the problem and run \
+                 `lf retry {id}` to finish it in the same worktree.",
+                dir.display(),
+                id = task.id
+            ));
         }
     }
 }
 
-/// Requeues the task after `retry_delay` if it has retries left, otherwise
-/// archives it as failed.
+/// Requeues the task after `retry_delay` if a retry could help and it has
+/// retries left, otherwise archives it as failed. `retry` is false for
+/// failures a retry can't fix (e.g. the provider rejected the model).
 fn fail_attempt(
     home: &Home,
     path: &Path,
     mut task: Task,
     eff: &Effective,
     error: String,
+    retry: bool,
     now: DateTime<FixedOffset>,
 ) -> Result<()> {
     task.error = Some(error);
     task.tmux_window = None;
-    if retry_left(
-        task.attempts.saturating_sub(task.interruptions),
-        eff.retries,
-    ) {
+    if retry
+        && retry_left(
+            task.attempts.saturating_sub(task.interruptions),
+            eff.retries,
+        )
+    {
         task.status = Status::Pending;
         task.scheduled_at = Some(now + eff.retry_delay);
         log(&format!(
@@ -858,7 +1030,7 @@ fn start(
     now: DateTime<FixedOffset>,
 ) -> Result<bool> {
     let eff = task.spec.resolve(&config.defaults);
-    let problems = task.problems(config, Some(path));
+    let problems = start_problems(config, &task, path);
     if !problems.is_empty() {
         task.status = Status::Failed;
         task.error = Some(format!("invalid task: {}", problems.join("; ")));
@@ -902,11 +1074,39 @@ fn start(
                 task,
                 &eff,
                 format!("could not start: {e:#}"),
+                true,
                 now,
             )?;
             Ok(false)
         }
     }
+}
+
+/// Everything that stops a task from starting: `Task::problems` plus
+/// runner-only checks. Chiefly, whether the agent's program can actually be
+/// run — that is deliberately not part of `Task::problems`, so a task may
+/// still be queued (and validated) before its agent is installed.
+fn start_problems(config: &Config, task: &Task, path: &Path) -> Vec<String> {
+    let mut out = task.problems(config, Some(path));
+    let eff = task.spec.resolve(&config.defaults);
+    if let Some(name) = eff.agent.as_deref()
+        && let Some(agent) = config.agents.get(name)
+    {
+        let template = match eff.mode {
+            Mode::Headless => &agent.headless,
+            Mode::Interactive => &agent.interactive,
+        };
+        if let Some(program) = template.first()
+            && !crate::config::on_path(program)
+            && !Path::new(program).is_file()
+        {
+            out.push(format!(
+                "agent `{name}`: `{program}` is not on $PATH; install it or fix \
+                 [agents.{name}] in config.toml (`lf doctor` shows the setup)"
+            ));
+        }
+    }
+    out
 }
 
 fn remove_if_exists(path: &Path) -> Result<()> {
@@ -1052,6 +1252,30 @@ mod tests {
         assert!(retry_left(1, 1));
         assert!(!retry_left(2, 1));
         assert!(!retry_left(1, 0));
+    }
+
+    #[test]
+    fn finds_a_provider_error_and_strips_its_colours() {
+        let log = "normal output\n\u{1b}[91m\u{1b}[1mError: \u{1b}[0mError from provider (Console): \
+                   This model is not available in your country\nmore output\n";
+        let line = provider_error_line(log).unwrap();
+        assert_eq!(
+            line,
+            "Error: Error from provider (Console): This model is not available in your country"
+        );
+        assert!(!line.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn no_provider_error_in_ordinary_output() {
+        assert!(provider_error_line("all good\nwrote 3 files\n").is_none());
+        assert!(provider_error_line("model = \"gpt\"\n").is_none());
+    }
+
+    #[test]
+    fn strips_common_escape_sequences() {
+        assert_eq!(strip_ansi("a\u{1b}[31mred\u{1b}[0mb"), "aredb");
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{7}after"), "after");
     }
 
     #[test]

@@ -132,9 +132,11 @@ impl TaskSpec {
                 "no agent: set `agent` (one of {}) here or under [defaults] in config.toml",
                 known()
             )),
-            Some((name, None)) => {
-                out.push(format!("unknown agent `{name}` (configured: {})", known()))
-            }
+            Some((name, None)) => out.push(format!(
+                "unknown agent `{name}`: add an [agents.{name}] section to config.toml, \
+                 or use one of: {}",
+                known()
+            )),
             Some((name, Some(agent))) => {
                 if eff.model.is_some() && agent.model_args.is_empty() {
                     out.push(format!(
