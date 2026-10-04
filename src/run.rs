@@ -656,17 +656,18 @@ fn poll_running(
             }
         }
         // When an attempt failed, prefer a provider error found in its log
-        // (a rejected model, missing credentials) over the bare exit code,
-        // and don't retry: the identical model would fail the same way. Only
-        // failed attempts are scanned: a successful run's output may mention
-        // these phrases (e.g. while working on code that does).
+        // (a rejected model, missing credentials) over the bare exit code.
+        // Permanent ones aren't retried: the identical model would fail the
+        // same way. Temporary ones (a rate limit, an overloaded provider)
+        // are. Only failed attempts are scanned: a successful run's output
+        // may mention these phrases (e.g. while working on code that does).
         if matches!(outcome, Outcome::Failed { .. })
-            && let Some(error) = provider_error(home, &task)
+            && let Some((error, retry)) = provider_error(home, &task)
         {
             outcome = Outcome::Failed {
                 error,
                 exit_code: exit_code_of(exit),
-                retry: false,
+                retry,
             };
         }
         match outcome {
@@ -692,16 +693,47 @@ fn exit_code_of(exit: Option<Exit>) -> Option<i32> {
 }
 
 /// A provider- or model-level error the agent reported, as an actionable
-/// message. `None` if the attempt's log has no such line (or there is no log).
-fn provider_error(home: &Home, task: &Task) -> Option<String> {
+/// message, and whether a retry could help. `None` if the attempt's log has
+/// no such line (or there is no log).
+fn provider_error(home: &Home, task: &Task) -> Option<(String, bool)> {
     let path = log_file(home, &task.id, task.attempts);
     let line = provider_error_line(&read_log_tail(&path)?)?;
-    Some(format!(
-        "the agent's provider rejected the run: {line}. Retrying the same model would fail \
-         the same way, so it wasn't retried: fix the provider or set a different `model`, \
-         then run `lf retry {id}`",
-        id = task.id
-    ))
+    Some(if is_transient(&line) {
+        (
+            format!("the agent's provider reported a temporary error: {line}"),
+            true,
+        )
+    } else {
+        (
+            format!(
+                "the agent's provider rejected the run: {line}. Retrying the same model would \
+                 fail the same way, so it wasn't retried: fix the provider or set a different \
+                 `model`, then run `lf retry {id}`",
+                id = task.id
+            ),
+            false,
+        )
+    })
+}
+
+/// Wording of a provider error that clears up by itself, so a retry is worth
+/// it even though the line also looks like a rejection.
+const TRANSIENT_MARKERS: &[&str] = &[
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "overloaded",
+    "try again",
+    "temporarily",
+    "timed out",
+    "timeout",
+    "service unavailable",
+    "capacity",
+];
+
+fn is_transient(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// Signatures of an error only the provider/model can explain, e.g.
@@ -1370,6 +1402,18 @@ mod tests {
             "Error: Error from provider (Console): This model is not available in your country"
         );
         assert!(!line.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_rate_limit_is_transient_and_a_rejected_model_is_not() {
+        assert!(is_transient(
+            "Error: Error from provider (Console): Rate limit exceeded. Please try again later."
+        ));
+        assert!(is_transient("overloaded_error: Overloaded"));
+        assert!(!is_transient(
+            "Error from provider (Console): This model is not available in your country"
+        ));
+        assert!(!is_transient("invalid api key"));
     }
 
     #[test]
