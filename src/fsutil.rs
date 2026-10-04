@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 
 /// A temp file next to `path`, so the final rename stays on one filesystem.
 /// Its name doesn't end in `.md`, so the folder scans never pick it up.
-fn temp_path(path: &Path) -> PathBuf {
+pub(crate) fn temp_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -125,6 +125,38 @@ mod tests {
         assert_eq!(kind, Some(std::io::ErrorKind::AlreadyExists));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// A full disk (or any other failure while the temp file is
+    /// written) can't be simulated portably, but planting a
+    /// directory where the temp file would go fails the write the
+    /// same way, before the rename: the original file must come
+    /// through intact.
+    #[test]
+    fn a_failed_write_leaves_the_original_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        write_atomic(&path, "original").unwrap();
+        let planted = temp_path(&path);
+        std::fs::create_dir(&planted).unwrap();
+        let err = write_atomic(&path, "replacement").unwrap_err();
+        assert!(
+            err.to_string().contains(&planted.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        std::fs::remove_dir(&planted).unwrap();
+    }
+
+    #[test]
+    fn a_failed_create_leaves_no_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        let planted = temp_path(&path);
+        std::fs::create_dir(&planted).unwrap();
+        assert!(create_atomic(&path, "first").is_err());
+        assert!(!path.exists());
+        std::fs::remove_dir(&planted).unwrap();
     }
 
     #[test]

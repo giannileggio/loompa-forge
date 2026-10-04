@@ -55,6 +55,7 @@ pub fn clean(home: &Home, args: CleanArgs) -> Result<()> {
             State::Archived(status, finished_at) => {
                 eligible(status, finished_at, args.all, args.older_than, now)
             }
+            State::Unreadable => Err("unreadable task file".to_string()),
             State::Orphan if args.older_than.is_some() => {
                 Err("no task file, so its age is unknown".into())
             }
@@ -106,7 +107,22 @@ pub fn clean(home: &Home, args: CleanArgs) -> Result<()> {
 fn prune_archive(home: &Home, args: &CleanArgs, now: DateTime<FixedOffset>) -> Result<()> {
     let (mut removed, mut kept) = (0, 0);
     for path in md_files(&home.archive())? {
-        let task = Task::load(&path)?;
+        let id = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        // A half-written or hand-edited file is reported and
+        // kept, like the runner does, instead of aborting the
+        // whole clean.
+        let task = match Task::load(&path) {
+            Ok(task) => task,
+            Err(e) => {
+                kept += 1;
+                println!("kept     {id}: unreadable task file: {e:#}");
+                continue;
+            }
+        };
         let id = task.id.clone();
         let verdict = eligible(
             task.status,
@@ -174,6 +190,9 @@ fn remove_logs(home: &Home, id: &str) -> Result<()> {
 enum State {
     Queued,
     Archived(Status, Option<DateTime<FixedOffset>>),
+    /// The archived file is there but can't be read (half-written
+    /// or hand-edited). Kept as-is, worktree included.
+    Unreadable,
     Orphan,
 }
 
@@ -186,8 +205,13 @@ fn task_state(home: &Home, id: &str) -> Result<State> {
     if !archived.exists() {
         return Ok(State::Orphan);
     }
-    let task = Task::load(&archived)?;
-    Ok(State::Archived(task.status, task.finished_at))
+    match Task::load(&archived) {
+        Ok(task) => Ok(State::Archived(task.status, task.finished_at)),
+        Err(e) => {
+            println!("warning: skipping {}: {e:#}", archived.display());
+            Ok(State::Unreadable)
+        }
+    }
 }
 
 /// Whether an archived task's worktree may go, or why not.
@@ -340,5 +364,38 @@ mod tests {
         clean(&home, args).unwrap();
 
         assert!(home.archive().join("old-done.md").exists());
+    }
+
+    /// A half-written or hand-edited archived task file is
+    /// reported and kept (with its worktree), not fatal and not
+    /// deleted.
+    #[test]
+    fn clean_skips_and_reports_unreadable_task_files() {
+        let (_d, home) = home();
+        archive(&home, "good", Status::Done, Some(now()));
+        std::fs::write(
+            home.archive().join("bad.md"),
+            "---\nid: bad\nstatus: ", // frontmatter never closed
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.worktrees().join("bad")).unwrap();
+
+        let args = CleanArgs {
+            all: true,
+            older_than: None,
+            archive: true,
+            dry_run: false,
+        };
+        clean(&home, args).unwrap();
+
+        assert!(!home.archive().join("good.md").exists());
+        assert!(
+            home.archive().join("bad.md").exists(),
+            "an unreadable file is kept, not dropped"
+        );
+        assert!(
+            home.worktrees().join("bad").exists(),
+            "its worktree is kept too"
+        );
     }
 }
