@@ -1102,6 +1102,26 @@ fn a_pane_that_dies_without_a_status_fails_with_an_explanation() {
 }
 
 #[test]
+fn a_rate_limit_error_is_retried() {
+    let env = Env::new("");
+    // The first attempt hits a rate limit; the retry succeeds.
+    env.add(
+        "limited",
+        "if [ -e ran-once ]; then exit 0; fi; touch ran-once; \
+         echo 'Error from provider (Console): Rate limit exceeded. Please try again later.' >&2; \
+         exit 1",
+        &["--retries", "1", "--no-worktree"],
+    );
+
+    assert_eq!(env.run_until_archived("limited"), "done");
+    assert_eq!(
+        env.field("limited", "attempts").as_deref(),
+        Some("2"),
+        "a rate limit is worth another attempt"
+    );
+}
+
+#[test]
 fn a_provider_error_fails_with_its_reason_and_is_not_retried() {
     let env = Env::new("");
     env.add(
